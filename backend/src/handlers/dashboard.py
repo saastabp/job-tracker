@@ -119,10 +119,39 @@ def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
         )
         date_row = cur.fetchone() or {}
 
+        cur.execute(
+            """
+            SELECT
+                s.id, s.role_title, s.submitted_on,
+                c.name AS company_name,
+                ss.short_name AS status,
+                s.updated_at
+            FROM submissions s
+            JOIN submission_statuses ss ON ss.id = s.submission_status_id
+            LEFT JOIN companies c ON c.id = s.company_id AND c.deleted_at IS NULL
+            WHERE s.user_id = %s AND s.deleted_at IS NULL
+            ORDER BY s.updated_at DESC
+            LIMIT 10
+            """,
+            (user_id,),
+        )
+        recent = [
+            {
+                "id": int(r["id"]),
+                "role_title": r["role_title"],
+                "company_name": r["company_name"],
+                "status": r["status"],
+                "submitted_on": str(r["submitted_on"]) if r["submitted_on"] else None,
+                "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
+            }
+            for r in cur.fetchall()
+        ]
+
     return {
         "today": str(date_row.get("today")),
         "week_start": str(date_row.get("week_start")),
         "metrics": metrics,
+        "recent_submissions": recent,
     }
 
 

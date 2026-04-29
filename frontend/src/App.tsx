@@ -4,6 +4,10 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import AppShell from './layout/AppShell';
 import Dashboard from './pages/Dashboard';
 import Targets from './pages/Targets';
+import Submissions from './pages/Submissions';
+import SubmissionDetail from './pages/SubmissionDetail';
+import Companies from './pages/Companies';
+import CompanyDetail from './pages/CompanyDetail';
 import Health from './pages/Health';
 import Login from './pages/Login';
 import ComingSoon from './pages/ComingSoon';
@@ -30,14 +34,10 @@ export default function App() {
       <Routes>
         <Route element={<AppShell />}>
           <Route index element={<Dashboard />} />
-          <Route
-            path="submissions"
-            element={<ComingSoon title="Submissions" slice="slice 03" />}
-          />
-          <Route
-            path="companies"
-            element={<ComingSoon title="Companies" slice="slice 03" />}
-          />
+          <Route path="submissions" element={<Submissions />} />
+          <Route path="submissions/:id" element={<SubmissionDetail />} />
+          <Route path="companies" element={<Companies />} />
+          <Route path="companies/:id" element={<CompanyDetail />} />
           <Route
             path="resumes"
             element={<ComingSoon title="Resumes" slice="slice 04" />}

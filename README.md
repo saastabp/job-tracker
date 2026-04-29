@@ -2,7 +2,7 @@
 
 Web app for tracking job-search activity (resume submissions, responses, follow-ups, daily/weekly targets), built as an AWS-native serverless reference architecture.
 
-This repo is the **foundational scaffold** — a vertical slice that proves the spine works end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React). Business features (submissions CRUD, AI-assisted resume tailoring, SES inbound email pipeline, scheduled follow-up reminders) land in follow-up plans on top of this skeleton.
+The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), and submissions + companies CRUD with JD-snapshot archival to S3 (slice 03). Remaining business features (AI-assisted resume tailoring, SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
 
 ## Architecture
 
@@ -255,16 +255,20 @@ job-tracker/
 │   └── Makefile                # deploy orchestration (local convenience)
 ├── backend/                    # Python Lambda code
 │   ├── src/
-│   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), logger
-│   │   ├── handlers/           # Lambda entrypoints
+│   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), users, logger
+│   │   ├── handlers/           # Lambda entrypoints (health, migrate, post_confirmation,
+│   │   │                       #   targets, dashboard, companies, submissions)
+│   │   ├── migrations/         # forward-only SQL files run by handlers/migrate.py
 │   │   └── requirements.txt    # runtime deps for sam build
-│   ├── tests/                  # pytest unit tests
+│   ├── tests/                  # pytest unit tests (one test_<handler>.py per Lambda)
 │   └── pyproject.toml          # local dev environment + dev deps
 ├── frontend/                   # React + Vite + react-bootstrap + react-oidc-context
 │   ├── src/
 │   │   ├── auth/config.ts      # OIDC config + Cognito logout helper
 │   │   ├── api/client.ts       # useApi() hook — fetch with bearer token
-│   │   ├── pages/{Health,Login}.tsx
+│   │   ├── layout/AppShell.tsx # navbar + sidebar shell wrapping all routed pages
+│   │   ├── pages/              # Dashboard, Submissions, SubmissionDetail, SubmissionForm,
+│   │   │                       #   Companies, CompanyDetail, Targets, Health, Login, ComingSoon
 │   │   ├── App.tsx
 │   │   └── main.tsx
 │   ├── index.html
@@ -292,6 +296,5 @@ These are tracked for follow-up plans and have stack-shaped homes ready for them
 - Follow-up reminder scheduler (EventBridge + Lambda + SES outbound) — `scheduler` stack
 - Custom domain (Route 53, ACM us-east-1, CloudFront alias, Cognito custom domain, API Gateway custom domain) — `domain` stack
 - CI/CD via GitHub Actions (OIDC trust + deploy role) — `ci` stack + `.github/workflows/`
-- Submissions / targets / responses CRUD endpoints + UI
-- Migrations tooling (Alembic vs SQL files)
+- Responses CRUD + UI (lands with the `email` stack — responses are inbound-email-driven)
 - DLQs, alarms, dashboards, WAF

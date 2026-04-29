@@ -30,6 +30,12 @@ Parameters:
   UserPoolArn:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /jobtracker/auth/user-pool-arn
+  ResumeBucketName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/resume-bucket-name
+  ResumeBucketArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/resume-bucket-arn
   CorsOrigins:
     Type: CommaDelimitedList
     Default: 'http://localhost:5173'
@@ -216,6 +222,110 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /dashboard/today
             Method: GET
+
+  CompaniesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-companies
+      CodeUri: ../../backend/src
+      Handler: handlers.companies.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        ListCompanies:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /companies
+            Method: GET
+        CreateCompany:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /companies
+            Method: POST
+        GetCompany:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /companies/{id}
+            Method: GET
+        UpdateCompany:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /companies/{id}
+            Method: PUT
+
+  SubmissionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-submissions
+      CodeUri: ../../backend/src
+      Handler: handlers.submissions.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          RESUME_BUCKET: !Ref ResumeBucketName
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub '${ResumeBucketArn}/users/*'
+      Events:
+        ListSubmissions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions
+            Method: GET
+        CreateSubmission:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions
+            Method: POST
+        GetSubmission:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}
+            Method: GET
+        UpdateSubmission:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}
+            Method: PUT
 
   PostConfirmationCognitoPermission:
     Type: AWS::Lambda::Permission

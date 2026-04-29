@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Row, Col, Card, Spinner, Alert, ProgressBar } from 'react-bootstrap';
+import { Link } from 'react-router-dom';
 import { useApi } from '../api/client';
+import { StatusBadge } from './Submissions';
 
 interface Metric {
   today?: number;
@@ -8,6 +10,15 @@ interface Metric {
   pending?: number;
   daily: number | null;
   weekly: number | null;
+}
+
+interface RecentSubmission {
+  id: number;
+  role_title: string | null;
+  company_name: string | null;
+  status: string;
+  submitted_on: string | null;
+  updated_at: string | null;
 }
 
 interface DashboardData {
@@ -19,6 +30,7 @@ interface DashboardData {
     recruiter_outreach: Metric;
     follow_ups: Metric;
   };
+  recent_submissions: RecentSubmission[];
 }
 
 const TODAY_TILES: { key: keyof DashboardData['metrics']; label: string }[] = [
@@ -103,17 +115,41 @@ export default function Dashboard() {
       </Row>
 
       <Row className="g-3">
-        <Col md={6}>
+        <Col md={8}>
           <Card>
             <Card.Body>
               <Card.Title>Recent activity</Card.Title>
-              <Card.Text className="text-muted mb-0">
-                No activity yet — submissions and responses will appear here.
-              </Card.Text>
+              {data.recent_submissions.length === 0 ? (
+                <Card.Text className="text-muted mb-0">
+                  No activity yet — submissions and responses will appear here.
+                </Card.Text>
+              ) : (
+                <ul className="list-unstyled mb-0">
+                  {data.recent_submissions.map((s) => (
+                    <li
+                      key={s.id}
+                      className="py-2 border-bottom d-flex align-items-center"
+                    >
+                      <span className="me-2">
+                        <StatusBadge status={s.status} />
+                      </span>
+                      <Link to={`/submissions/${s.id}`} className="me-2">
+                        {s.role_title ?? '(untitled)'}
+                      </Link>
+                      <span className="text-muted me-2">
+                        {s.company_name ? `at ${s.company_name}` : ''}
+                      </span>
+                      <span className="ms-auto text-muted small">
+                        {s.submitted_on ?? ''}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6}>
+        <Col md={4}>
           <Card>
             <Card.Body>
               <Card.Title>Pending follow-ups</Card.Title>
