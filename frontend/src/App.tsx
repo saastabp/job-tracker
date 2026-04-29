@@ -1,8 +1,12 @@
-import { Container, Navbar, Nav, Button } from 'react-bootstrap';
+import { Container } from 'react-bootstrap';
 import { useAuth } from 'react-oidc-context';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import AppShell from './layout/AppShell';
+import Dashboard from './pages/Dashboard';
+import Targets from './pages/Targets';
 import Health from './pages/Health';
 import Login from './pages/Login';
-import { cognitoLogout } from './auth/config';
+import ComingSoon from './pages/ComingSoon';
 
 export default function App() {
   const auth = useAuth();
@@ -17,44 +21,39 @@ export default function App() {
     );
   }
 
-  const username =
-    (auth.user?.profile.email as string | undefined) ?? auth.user?.profile.sub;
-
-  async function handleSignOut() {
-    await auth.removeUser();
-    cognitoLogout();
+  if (!auth.isAuthenticated) {
+    return <Login />;
   }
 
   return (
-    <>
-      <Navbar bg="dark" variant="dark">
-        <Container>
-          <Navbar.Brand>Job Tracker</Navbar.Brand>
-          <Nav className="ms-auto align-items-center">
-            {auth.isAuthenticated ? (
-              <>
-                <Navbar.Text className="me-3">{username}</Navbar.Text>
-                <Button
-                  variant="outline-light"
-                  size="sm"
-                  onClick={handleSignOut}
-                >
-                  Sign out
-                </Button>
-              </>
-            ) : (
-              <Button
-                variant="outline-light"
-                size="sm"
-                onClick={() => auth.signinRedirect()}
-              >
-                Sign in
-              </Button>
-            )}
-          </Nav>
-        </Container>
-      </Navbar>
-      {auth.isAuthenticated ? <Health /> : <Login />}
-    </>
+    <BrowserRouter>
+      <Routes>
+        <Route element={<AppShell />}>
+          <Route index element={<Dashboard />} />
+          <Route
+            path="submissions"
+            element={<ComingSoon title="Submissions" slice="slice 03" />}
+          />
+          <Route
+            path="companies"
+            element={<ComingSoon title="Companies" slice="slice 03" />}
+          />
+          <Route
+            path="resumes"
+            element={<ComingSoon title="Resumes" slice="slice 04" />}
+          />
+          <Route
+            path="contacts"
+            element={<ComingSoon title="Contacts" slice="slice 05" />}
+          />
+          <Route path="targets" element={<Targets />} />
+          <Route path="health" element={<Health />} />
+          <Route
+            path="*"
+            element={<ComingSoon title="Not found" slice="404" />}
+          />
+        </Route>
+      </Routes>
+    </BrowserRouter>
   );
 }

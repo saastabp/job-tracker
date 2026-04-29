@@ -1,9 +1,13 @@
-import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { Container, Navbar, Nav, Button } from 'react-bootstrap';
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { Container } from 'react-bootstrap';
 import { useAuth } from 'react-oidc-context';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import AppShell from './layout/AppShell';
+import Dashboard from './pages/Dashboard';
+import Targets from './pages/Targets';
 import Health from './pages/Health';
 import Login from './pages/Login';
-import { cognitoLogout } from './auth/config';
+import ComingSoon from './pages/ComingSoon';
 export default function App() {
     const auth = useAuth();
     if (auth.isLoading) {
@@ -12,10 +16,8 @@ export default function App() {
     if (auth.error) {
         return (_jsxs(Container, { className: "mt-5", children: ["Auth error: ", auth.error.message] }));
     }
-    const username = auth.user?.profile.email ?? auth.user?.profile.sub;
-    async function handleSignOut() {
-        await auth.removeUser();
-        cognitoLogout();
+    if (!auth.isAuthenticated) {
+        return _jsx(Login, {});
     }
-    return (_jsxs(_Fragment, { children: [_jsx(Navbar, { bg: "dark", variant: "dark", children: _jsxs(Container, { children: [_jsx(Navbar.Brand, { children: "Job Tracker" }), _jsx(Nav, { className: "ms-auto align-items-center", children: auth.isAuthenticated ? (_jsxs(_Fragment, { children: [_jsx(Navbar.Text, { className: "me-3", children: username }), _jsx(Button, { variant: "outline-light", size: "sm", onClick: handleSignOut, children: "Sign out" })] })) : (_jsx(Button, { variant: "outline-light", size: "sm", onClick: () => auth.signinRedirect(), children: "Sign in" })) })] }) }), auth.isAuthenticated ? _jsx(Health, {}) : _jsx(Login, {})] }));
+    return (_jsx(BrowserRouter, { children: _jsx(Routes, { children: _jsxs(Route, { element: _jsx(AppShell, {}), children: [_jsx(Route, { index: true, element: _jsx(Dashboard, {}) }), _jsx(Route, { path: "submissions", element: _jsx(ComingSoon, { title: "Submissions", slice: "slice 03" }) }), _jsx(Route, { path: "companies", element: _jsx(ComingSoon, { title: "Companies", slice: "slice 03" }) }), _jsx(Route, { path: "resumes", element: _jsx(ComingSoon, { title: "Resumes", slice: "slice 04" }) }), _jsx(Route, { path: "contacts", element: _jsx(ComingSoon, { title: "Contacts", slice: "slice 05" }) }), _jsx(Route, { path: "targets", element: _jsx(Targets, {}) }), _jsx(Route, { path: "health", element: _jsx(Health, {}) }), _jsx(Route, { path: "*", element: _jsx(ComingSoon, { title: "Not found", slice: "404" }) })] }) }) }));
 }

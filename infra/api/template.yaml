@@ -149,6 +149,74 @@ Resources:
               Action: rds-db:connect
               Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
 
+  TargetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-targets
+      CodeUri: ../../backend/src
+      Handler: handlers.targets.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        GetTargets:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /targets
+            Method: GET
+        PutTargets:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /targets
+            Method: PUT
+
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-dashboard
+      CodeUri: ../../backend/src
+      Handler: handlers.dashboard.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        GetDashboardToday:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /dashboard/today
+            Method: GET
+
   PostConfirmationCognitoPermission:
     Type: AWS::Lambda::Permission
     Properties:
