@@ -1,6 +1,6 @@
 .PHONY: help check-prereqs fetch-rds-ca \
         deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-all \
-        wire-frontend \
+        wire-frontend migrate \
         deploy-bastion destroy-bastion tunnel db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
@@ -25,6 +25,7 @@ help:
 	@echo "  deploy-frontend   Deploy S3 SPA bucket + CloudFront"
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
 	@echo "  wire-frontend     Re-deploy auth + api with the CloudFront URL added to callbacks/CORS"
+	@echo "  migrate           Invoke the MigrationRunner Lambda (applies pending backend/migrations/*.sql)"
 	@echo "  deploy-bastion    Deploy transient bastion EC2 (for DB admin tunnel)"
 	@echo "  destroy-bastion   Tear down bastion EC2 when admin work is done"
 	@echo "  tunnel            Open SSM port-forward to RDS (requires deploy-bastion)"
@@ -58,8 +59,12 @@ deploy-data: deploy-network
 # fixes this once the frontend stack creates the URL.
 deploy-auth:
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
-	if [ -n "$$CF_URL" ]; then \
-		cd $(ROOT)/infra/auth && sam deploy --parameter-overrides "CallbackUrls=http://localhost:5173/,$$CF_URL/" "LogoutUrls=http://localhost:5173/,$$CF_URL/"; \
+	PCF_ARN=$$(aws ssm get-parameter --name /jobtracker/api/post-confirmation-function-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	ARGS=""; \
+	if [ -n "$$CF_URL" ]; then ARGS="$$ARGS CallbackUrls=http://localhost:5173/,$$CF_URL/ LogoutUrls=http://localhost:5173/,$$CF_URL/"; fi; \
+	if [ -n "$$PCF_ARN" ]; then ARGS="$$ARGS PostConfirmationFunctionArn=$$PCF_ARN"; fi; \
+	if [ -n "$$ARGS" ]; then \
+		cd $(ROOT)/infra/auth && sam deploy --parameter-overrides $$ARGS; \
 	else \
 		cd $(ROOT)/infra/auth && sam deploy; \
 	fi
@@ -84,12 +89,18 @@ wire-frontend:
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url \
 		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
 	[ -n "$$CF_URL" ] || { echo "error: /jobtracker/frontend/cloudfront-url not in SSM (deploy-frontend first)" >&2; exit 1; } && \
+	PCF_ARN=$$(aws ssm get-parameter --name /jobtracker/api/post-confirmation-function-arn \
+		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
 	echo "Wiring CloudFront URL into auth + api: $$CF_URL" && \
-	cd $(ROOT)/infra/auth && sam deploy --parameter-overrides \
-		"CallbackUrls=http://localhost:5173/,$$CF_URL/" \
-		"LogoutUrls=http://localhost:5173/,$$CF_URL/" && \
+	AUTH_ARGS="CallbackUrls=http://localhost:5173/,$$CF_URL/ LogoutUrls=http://localhost:5173/,$$CF_URL/"; \
+	if [ -n "$$PCF_ARN" ]; then AUTH_ARGS="$$AUTH_ARGS PostConfirmationFunctionArn=$$PCF_ARN"; fi; \
+	cd $(ROOT)/infra/auth && sam deploy --parameter-overrides $$AUTH_ARGS && \
 	cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides \
 		"CorsOrigins=http://localhost:5173,$$CF_URL"
+
+migrate:
+	aws lambda invoke --function-name jobtracker-migrate --region $(REGION) --no-cli-pager /tmp/jobtracker-migrate.json
+	@cat /tmp/jobtracker-migrate.json && echo
 
 deploy-bastion: deploy-network
 	cd $(ROOT)/infra/bastion && sam deploy \

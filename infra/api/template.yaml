@@ -27,6 +27,9 @@ Parameters:
   UserPoolProviderUrl:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /jobtracker/auth/user-pool-provider-url
+  UserPoolArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/auth/user-pool-arn
   CorsOrigins:
     Type: CommaDelimitedList
     Default: 'http://localhost:5173'
@@ -97,6 +100,63 @@ Resources:
             Path: /health
             Method: GET
 
+  MigrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-migrate
+      CodeUri: ../../backend/src
+      Handler: handlers.migrate.handler
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-post-confirmation
+      CodeUri: ../../backend/src
+      Handler: handlers.post_confirmation.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+
+  PostConfirmationCognitoPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostConfirmationFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Ref UserPoolArn
+
   SsmApiUrl:
     Type: AWS::SSM::Parameter
     Properties:
@@ -104,8 +164,19 @@ Resources:
       Type: String
       Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
 
+  SsmPostConfirmationFunctionArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/api/post-confirmation-function-arn
+      Type: String
+      Value: !GetAtt PostConfirmationFunction.Arn
+
 Outputs:
   ApiUrl:
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
   HealthFunctionName:
     Value: !Ref HealthFunction
+  MigrationFunctionName:
+    Value: !Ref MigrationFunction
+  PostConfirmationFunctionArn:
+    Value: !GetAtt PostConfirmationFunction.Arn

@@ -38,7 +38,7 @@ def _auth_token() -> str:
 
 
 @contextmanager
-def get_connection() -> Iterator[Any]:
+def get_connection(*, client_flag: int = 0) -> Iterator[Any]:
     if not CA_BUNDLE.exists():
         raise RuntimeError(
             f"RDS CA bundle not found at {CA_BUNDLE}. "
@@ -57,6 +57,7 @@ def get_connection() -> Iterator[Any]:
             ssl={"ca": str(CA_BUNDLE)},
             connect_timeout=5,
             cursorclass=DictCursor,
+            client_flag=client_flag,
         )
         logger.info("db: connection opened")
     except Exception:

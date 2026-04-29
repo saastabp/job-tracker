@@ -14,6 +14,13 @@ Parameters:
     Default: INACTIVE
     AllowedValues: [ACTIVE, INACTIVE]
     Description: Flip to ACTIVE once you have real users you don't want to lose accidentally.
+  PostConfirmationFunctionArn:
+    Type: String
+    Default: ''
+    Description: ARN of the post-confirmation Lambda (from /jobtracker/api/post-confirmation-function-arn). Empty on the first deploy before the api stack exists; the Makefile populates it on subsequent deploys.
+
+Conditions:
+  HasPostConfirmation: !Not [!Equals [!Ref PostConfirmationFunctionArn, '']]
 
 Resources:
 
@@ -46,6 +53,10 @@ Resources:
       DeletionProtection: !Ref UserPoolDeletionProtection
       UserAttributeUpdateSettings:
         AttributesRequireVerificationBeforeUpdate: [email]
+      LambdaConfig: !If
+        - HasPostConfirmation
+        - PostConfirmation: !Ref PostConfirmationFunctionArn
+        - !Ref AWS::NoValue
 
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
