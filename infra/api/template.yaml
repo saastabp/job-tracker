@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Job Tracker - API stack (HTTP API Gateway, Cognito JWT auth, Lambda handlers)
+
+Parameters:
+  PrivateSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+    Default: /jobtracker/network/private-subnet-ids
+  LambdaSgId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /jobtracker/network/lambda-sg-id
+  DbEndpoint:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-endpoint
+  DbPort:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-port
+  DbName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-name
+  DbResourceId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-resource-id
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/auth/spa-client-id
+  UserPoolProviderUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/auth/user-pool-provider-url
+  CorsOrigins:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173'
+    Description: Allowed CORS origins. After the frontend stack deploys, add the CloudFront URL via stack update.
+  DbUser:
+    Type: String
+    Default: app
+    Description: MySQL user that the Lambda authenticates as via RDS IAM. Must be created in MySQL after the data stack deploys (see README bootstrap step).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Disabled
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: jobtracker-api
+      CorsConfiguration:
+        AllowOrigins: !Ref CorsOrigins
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref UserPoolProviderUrl
+              audience: [!Ref UserPoolClientId]
+        DefaultAuthorizer: CognitoAuth
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-health
+      CodeUri: ../../backend/src
+      Handler: handlers.health.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+
+  SsmApiUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/api/url
+      Type: String
+      Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  HealthFunctionName:
+    Value: !Ref HealthFunction

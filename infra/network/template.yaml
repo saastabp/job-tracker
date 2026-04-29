@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Job Tracker - Network stack (VPC, subnets, security groups, S3 gateway endpoint)
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+Resources:
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: jobtracker-vpc }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: jobtracker-public-a }
+        - { Key: tier, Value: public }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: jobtracker-public-b }
+        - { Key: tier, Value: public }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: jobtracker-private-a }
+        - { Key: tier, Value: private }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: jobtracker-private-b }
+        - { Key: tier, Value: private }
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: jobtracker-igw }
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: jobtracker-public-rt }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicSubnetARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnetBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: jobtracker-private-rt-a }
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: jobtracker-private-rt-b }
+
+  PrivateSubnetARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+
+  PrivateSubnetBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+
+  LambdaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambdas in private subnets (default all-egress)
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: jobtracker-lambda-sg }
+
+  RdsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL ingress from Lambda SG only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSg
+          Description: MySQL from lambda-sg
+      Tags:
+        - { Key: Name, Value: jobtracker-rds-sg }
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+
+  SsmVpcId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/network/vpc-id
+      Type: String
+      Value: !Ref Vpc
+
+  SsmPrivateSubnetIds:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/network/private-subnet-ids
+      Type: StringList
+      Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
+
+  SsmPublicSubnetIds:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/network/public-subnet-ids
+      Type: StringList
+      Value: !Sub '${PublicSubnetA},${PublicSubnetB}'
+
+  SsmLambdaSgId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/network/lambda-sg-id
+      Type: String
+      Value: !Ref LambdaSg
+
+  SsmRdsSgId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/network/rds-sg-id
+      Type: String
+      Value: !Ref RdsSg
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
+  LambdaSgId:
+    Value: !Ref LambdaSg
+  RdsSgId:
+    Value: !Ref RdsSg

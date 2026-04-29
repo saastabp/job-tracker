@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "routeKey": "GET /health",
+  "rawPath": "/health",
+  "headers": {},
+  "requestContext": {
+    "authorizer": {
+      "jwt": {
+        "claims": {
+          "sub": "test-user-1234",
+          "email": "you@example.com"
+        }
+      }
+    },
+    "http": { "method": "GET", "path": "/health" }
+  }
+}

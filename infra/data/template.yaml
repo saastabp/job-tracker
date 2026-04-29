@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Job Tracker - Data stack (RDS MySQL, S3 buckets)
+
+Parameters:
+  PrivateSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+    Default: /jobtracker/network/private-subnet-ids
+  RdsSgId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /jobtracker/network/rds-sg-id
+  DbName:
+    Type: String
+    Default: jobtracker
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+
+Resources:
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: jobtracker private subnets
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - { Key: Name, Value: jobtracker-db-subnets }
+
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: jobtracker-db
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DbName
+      MasterUsername: jtadmin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [ !Ref RdsSgId ]
+      PubliclyAccessible: false
+      MultiAZ: false
+      EnableIAMDatabaseAuthentication: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - { Key: Name, Value: jobtracker-db }
+
+  ResumeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'jobtracker-resumes-${AWS::AccountId}'
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: Name, Value: jobtracker-resumes }
+
+  InboundEmailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'jobtracker-inbound-email-${AWS::AccountId}'
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: Name, Value: jobtracker-inbound-email }
+
+  SsmDbEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/db-endpoint
+      Type: String
+      Value: !GetAtt Db.Endpoint.Address
+
+  SsmDbPort:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/db-port
+      Type: String
+      Value: !GetAtt Db.Endpoint.Port
+
+  SsmDbName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/db-name
+      Type: String
+      Value: !Ref DbName
+
+  SsmDbResourceId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/db-resource-id
+      Type: String
+      Value: !GetAtt Db.DbiResourceId
+
+  SsmDbMasterSecretArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/db-master-secret-arn
+      Type: String
+      Value: !GetAtt Db.MasterUserSecret.SecretArn
+
+  SsmResumeBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/resume-bucket-name
+      Type: String
+      Value: !Ref ResumeBucket
+
+  SsmResumeBucketArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/resume-bucket-arn
+      Type: String
+      Value: !GetAtt ResumeBucket.Arn
+
+  SsmInboundEmailBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/inbound-email-bucket-name
+      Type: String
+      Value: !Ref InboundEmailBucket
+
+  SsmInboundEmailBucketArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/data/inbound-email-bucket-arn
+      Type: String
+      Value: !GetAtt InboundEmailBucket.Arn
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt Db.Endpoint.Address
+  DbResourceId:
+    Value: !GetAtt Db.DbiResourceId
+  DbMasterSecretArn:
+    Value: !GetAtt Db.MasterUserSecret.SecretArn
+  ResumeBucketName:
+    Value: !Ref ResumeBucket
+  InboundEmailBucketName:
+    Value: !Ref InboundEmailBucket

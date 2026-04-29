@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Job Tracker - Auth stack (Cognito User Pool, SPA app client, Hosted UI domain)
+
+Parameters:
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173/'
+    Description: OAuth callback URLs for the SPA app client. After the frontend stack deploys, add the CloudFront URL via stack update.
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173/'
+  UserPoolDeletionProtection:
+    Type: String
+    Default: INACTIVE
+    AllowedValues: [ACTIVE, INACTIVE]
+    Description: Flip to ACTIVE once you have real users you don't want to lose accidentally.
+
+Resources:
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: jobtracker
+      AliasAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      MfaConfiguration: 'OFF'
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      DeletionProtection: !Ref UserPoolDeletionProtection
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'jobtracker-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  SpaClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: jobtracker-spa
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, profile, email]
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      SupportedIdentityProviders: [COGNITO]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  SsmUserPoolId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/auth/user-pool-id
+      Type: String
+      Value: !Ref UserPool
+
+  SsmUserPoolArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/auth/user-pool-arn
+      Type: String
+      Value: !GetAtt UserPool.Arn
+
+  SsmUserPoolProviderUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/auth/user-pool-provider-url
+      Type: String
+      Value: !GetAtt UserPool.ProviderURL
+
+  SsmSpaClientId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/auth/spa-client-id
+      Type: String
+      Value: !Ref SpaClient
+
+  SsmCognitoDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/auth/cognito-domain
+      Type: String
+      Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+  SpaClientId:
+    Value: !Ref SpaClient
+  CognitoDomain:
+    Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'

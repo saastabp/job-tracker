@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Job Tracker - Frontend stack (private S3 SPA bucket + CloudFront with OAC)
+
+Resources:
+
+  SpaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'jobtracker-spa-${AWS::AccountId}'
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: Name, Value: jobtracker-spa }
+
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: jobtracker-spa-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Job Tracker SPA
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: SpaOrigin
+            DomainName: !GetAtt SpaBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref Oac
+        DefaultCacheBehavior:
+          TargetOriginId: SpaOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  SpaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SpaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadViaOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SpaBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  SsmCloudFrontDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/frontend/cloudfront-domain
+      Type: String
+      Value: !GetAtt Distribution.DomainName
+
+  SsmCloudFrontUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/frontend/cloudfront-url
+      Type: String
+      Value: !Sub 'https://${Distribution.DomainName}'
+
+  SsmSpaBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/frontend/spa-bucket-name
+      Type: String
+      Value: !Ref SpaBucket
+
+  SsmDistributionId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/frontend/distribution-id
+      Type: String
+      Value: !Ref Distribution
+
+Outputs:
+  CloudFrontDomain:
+    Value: !GetAtt Distribution.DomainName
+  CloudFrontUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  SpaBucketName:
+    Value: !Ref SpaBucket
+  DistributionId:
+    Value: !Ref Distribution
