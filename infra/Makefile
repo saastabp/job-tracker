@@ -1,6 +1,6 @@
 .PHONY: help check-prereqs fetch-rds-ca \
-        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-all \
-        wire-frontend migrate \
+        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-all \
+        wire-frontend migrate delete-ai \
         deploy-bastion destroy-bastion tunnel db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
@@ -23,8 +23,10 @@ help:
 	@echo "  deploy-auth       Deploy Cognito user pool + Hosted UI domain"
 	@echo "  deploy-api        Build + deploy API Gateway + Health Lambda"
 	@echo "  deploy-frontend   Deploy S3 SPA bucket + CloudFront"
+	@echo "  deploy-ai         Deploy AI stack (Bedrock-backed Lambdas, no VPC)"
+	@echo "  delete-ai         Tear down the AI stack"
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
-	@echo "  wire-frontend     Re-deploy auth + api with the CloudFront URL added to callbacks/CORS"
+	@echo "  wire-frontend     Re-deploy auth + api + ai with the CloudFront URL added to callbacks/CORS"
 	@echo "  migrate           Invoke the MigrationRunner Lambda (applies pending backend/migrations/*.sql)"
 	@echo "  deploy-bastion    Deploy transient bastion EC2 (for DB admin tunnel)"
 	@echo "  destroy-bastion   Tear down bastion EC2 when admin work is done"
@@ -80,9 +82,24 @@ deploy-api: deploy-network deploy-data deploy-auth fetch-rds-ca
 deploy-frontend:
 	cd $(ROOT)/infra/frontend && sam deploy
 
-deploy-all: deploy-network deploy-data deploy-auth deploy-api deploy-frontend wire-frontend
+# AI stack runs OUTSIDE the VPC and only depends on auth (for the JWT
+# authorizer's user-pool params via SSM). Deployed independently of api/data
+# so it can be torn down without touching either.
+deploy-ai: deploy-auth
+	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	if [ -n "$$CF_URL" ]; then \
+		cd $(ROOT)/infra/ai && sam build && sam deploy --parameter-overrides "CorsOrigins=http://localhost:5173,$$CF_URL"; \
+	else \
+		cd $(ROOT)/infra/ai && sam build && sam deploy; \
+	fi
+
+delete-ai:
+	cd $(ROOT)/infra/ai && sam delete --no-prompts
+	@aws ssm delete-parameter --name /jobtracker/ai/url --region $(REGION) 2>/dev/null || true
+
+deploy-all: deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai wire-frontend
 	@echo
-	@echo "All stacks deployed and CloudFront URL wired into auth + api."
+	@echo "All stacks deployed and CloudFront URL wired into auth + api + ai."
 	@echo "Next: one-time bootstrap of the MySQL 'app' user (see README)."
 
 wire-frontend:
@@ -91,12 +108,16 @@ wire-frontend:
 	[ -n "$$CF_URL" ] || { echo "error: /jobtracker/frontend/cloudfront-url not in SSM (deploy-frontend first)" >&2; exit 1; } && \
 	PCF_ARN=$$(aws ssm get-parameter --name /jobtracker/api/post-confirmation-function-arn \
 		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
-	echo "Wiring CloudFront URL into auth + api: $$CF_URL" && \
+	echo "Wiring CloudFront URL into auth + api + ai: $$CF_URL" && \
 	AUTH_ARGS="CallbackUrls=http://localhost:5173/,$$CF_URL/ LogoutUrls=http://localhost:5173/,$$CF_URL/"; \
 	if [ -n "$$PCF_ARN" ]; then AUTH_ARGS="$$AUTH_ARGS PostConfirmationFunctionArn=$$PCF_ARN"; fi; \
 	cd $(ROOT)/infra/auth && sam deploy --parameter-overrides $$AUTH_ARGS && \
 	cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides \
-		"CorsOrigins=http://localhost:5173,$$CF_URL"
+		"CorsOrigins=http://localhost:5173,$$CF_URL" && \
+	if aws cloudformation describe-stacks --stack-name jobtracker-ai --region $(REGION) >/dev/null 2>&1; then \
+		cd $(ROOT)/infra/ai && sam build && sam deploy --parameter-overrides \
+			"CorsOrigins=http://localhost:5173,$$CF_URL"; \
+	fi
 
 migrate:
 	aws lambda invoke --function-name jobtracker-migrate --region $(REGION) --no-cli-pager /tmp/jobtracker-migrate.json
@@ -127,8 +148,10 @@ gen-frontend-env:
 		--query Parameter.Value --output text --region $(REGION)) && \
 	COGNITO_DOMAIN=$$(aws ssm get-parameter --name /jobtracker/auth/cognito-domain \
 		--query Parameter.Value --output text --region $(REGION)) && \
-	printf 'VITE_API_URL=%s\nVITE_COGNITO_AUTHORITY=%s\nVITE_COGNITO_CLIENT_ID=%s\nVITE_COGNITO_DOMAIN=%s\n' \
-		"$$API_URL" "$$AUTHORITY" "$$CLIENT_ID" "$$COGNITO_DOMAIN" \
+	AI_URL=$$(aws ssm get-parameter --name /jobtracker/ai/url \
+		--query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	printf 'VITE_API_URL=%s\nVITE_COGNITO_AUTHORITY=%s\nVITE_COGNITO_CLIENT_ID=%s\nVITE_COGNITO_DOMAIN=%s\nVITE_AI_API_URL=%s\n' \
+		"$$API_URL" "$$AUTHORITY" "$$CLIENT_ID" "$$COGNITO_DOMAIN" "$$AI_URL" \
 		> $(ROOT)/frontend/.env.local && \
 	echo "Wrote $(ROOT)/frontend/.env.local"
 
@@ -153,4 +176,4 @@ list-ssm:
 		--query 'Parameters[].[Name,Value]' --output table --region $(REGION)
 
 clean:
-	rm -rf $(ROOT)/infra/api/.aws-sam $(ROOT)/frontend/dist
+	rm -rf $(ROOT)/infra/api/.aws-sam $(ROOT)/infra/ai/.aws-sam $(ROOT)/frontend/dist

@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Job Tracker - AI stack (Bedrock-backed Lambdas for resume mining + tailoring)
+
+# This stack runs OUTSIDE the VPC (no VpcConfig on the Lambdas, no Bedrock
+# interface VPC endpoint). The AI Lambdas never touch the DB — every input
+# arrives in the request body. See architecture_decisions memory + slice 06
+# doc for the full reasoning. Saves ~$15/mo over a 2-AZ interface endpoint.
+
+Parameters:
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/auth/spa-client-id
+  UserPoolProviderUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/auth/user-pool-provider-url
+  CorsOrigins:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173'
+    Description: Allowed CORS origins. After the frontend stack deploys, add the CloudFront URL via stack update.
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: Bedrock inference profile / model ID. The us.* prefix is the cross-region inference profile that Anthropic models require for on-demand throughput.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 512
+    Tracing: Disabled
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+
+  AiHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: jobtracker-ai
+      CorsConfiguration:
+        AllowOrigins: !Ref CorsOrigins
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [POST, OPTIONS]
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref UserPoolProviderUrl
+              audience: [!Ref UserPoolClientId]
+        DefaultAuthorizer: CognitoAuth
+
+  AiMineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-ai-mine
+      CodeUri: ../../backend/src
+      Handler: handlers.ai_mine.handler
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+      Events:
+        Mine:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AiHttpApi
+            Path: /ai/mine-resume
+            Method: POST
+
+  AiTailorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-ai-tailor
+      CodeUri: ../../backend/src
+      Handler: handlers.ai_tailor.handler
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+      Events:
+        Tailor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AiHttpApi
+            Path: /ai/tailor
+            Method: POST
+
+  SsmAiUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/ai/url
+      Type: String
+      Value: !Sub 'https://${AiHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+Outputs:
+  AiUrl:
+    Value: !Sub 'https://${AiHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  AiMineFunctionName:
+    Value: !Ref AiMineFunction
+  AiTailorFunctionName:
+    Value: !Ref AiTailorFunction

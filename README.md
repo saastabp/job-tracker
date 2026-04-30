@@ -2,7 +2,7 @@
 
 Web app for tracking job-search activity (resume submissions, responses, follow-ups, daily/weekly targets), built as an AWS-native serverless reference architecture.
 
-The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), submissions + companies CRUD with JD-snapshot archival to S3 (slice 03), and resumes CRUD with browser-direct presigned-PUT uploads + submission linking (slice 04). Remaining business features (AI-assisted resume tailoring, SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
+The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), submissions + companies CRUD with JD-snapshot archival to S3 (slice 03), resumes CRUD with browser-direct presigned-PUT uploads + submission linking (slice 04), contacts + outreach CRUD wired into the dashboard (slice 05), and AI-assisted resume mining + tailoring via Bedrock-backed Lambdas (slice 06). Remaining business features (SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
 
 ## Architecture
 
@@ -17,13 +17,14 @@ Five SAM stacks, deployable independently and wired together via SSM Parameter S
 | `auth` | rarely changes | Cognito user pool, SPA app client, Hosted UI domain |
 | `api` | iterates often | HTTP API Gateway (Cognito JWT authorizer), Health Lambda in private subnets |
 | `frontend` | iterates often | Private S3 SPA bucket + CloudFront distribution (default `*.cloudfront.net` URL) |
+| `ai` | iterates often | HTTP API Gateway + AI Lambdas (Bedrock-backed resume mining + tailoring), runs **outside** the VPC |
 
-Future stacks (in follow-up plans, drop in without modifying the above): `ai`, `email`, `scheduler`, `domain`, `ci`.
+Future stacks (in follow-up plans, drop in without modifying the above): `email`, `scheduler`, `domain`, `ci`.
 
 **Key design choices** (full rationale in `infra/shared/ssm-naming.md` and the design memory):
-- No NAT gateway. Lambdas in private subnets reach AWS via VPC endpoints (S3 gateway endpoint = free; interface endpoints added only when a feature needs them, e.g., Bedrock with the `ai` stack).
+- No NAT gateway. Lambdas in private subnets reach AWS via VPC endpoints (S3 gateway endpoint = free; interface endpoints added only when a feature needs them).
 - IAM authentication from Lambda to MySQL. Master credential in Secrets Manager, used only for admin access via SSM Session Manager tunnel + BeeKeeper.
-- Bedrock (deferred to `ai` stack) over direct Anthropic API — no API key to manage, IAM-authed, fits the no-NAT story.
+- Bedrock over direct Anthropic API — no API key to manage, IAM-authed. The AI Lambdas live in the `ai` stack and run **outside** the VPC, so no Bedrock interface endpoint is needed (~$15/mo saved); they never touch the DB, all inputs come in the request body.
 - React SPA uses `react-oidc-context` (~30 KB) for OIDC redirect, not Amplify (~200 KB+). Hosted UI domain is the standard Cognito `*.amazoncognito.com`.
 
 ## Prerequisites
@@ -121,7 +122,7 @@ This deploys, in dependency order: `network` → `data` (RDS takes ~8 min on fir
 make -C infra list-ssm
 ```
 
-The SPA reads four of these (`/jobtracker/api/url`, `/jobtracker/auth/user-pool-provider-url`, `/jobtracker/auth/spa-client-id`, `/jobtracker/auth/cognito-domain`); `make -C infra dev-frontend` and `make -C infra sync-frontend` generate `frontend/.env.local` from them automatically.
+The SPA reads five of these (`/jobtracker/api/url`, `/jobtracker/ai/url`, `/jobtracker/auth/user-pool-provider-url`, `/jobtracker/auth/spa-client-id`, `/jobtracker/auth/cognito-domain`); `make -C infra dev-frontend` and `make -C infra sync-frontend` generate `frontend/.env.local` from them automatically. `/jobtracker/ai/url` is optional — paths under `/ai/` only resolve once the `ai` stack is deployed.
 
 ### One-time MySQL `app` user bootstrap
 
@@ -212,7 +213,9 @@ make -C infra sync-frontend
 | `make deploy-auth` | **Yes** | Auto-detects CloudFront URL from SSM and preserves Cognito callback wiring on every run. |
 | `make deploy-api` | **Yes** | Auto-detects CloudFront URL and preserves CORS wiring on every run. Re-runs `sam build` so Lambda code changes are picked up. |
 | `make deploy-frontend` | Yes | No parameter overrides to lose. CloudFront update can be slow (5–15 min). |
-| `make wire-frontend` | Yes (after `deploy-frontend`) | Forces re-application of the CloudFront URL to auth + api. Errors clearly if frontend not yet deployed. Mostly redundant now that auth/api auto-detect, but kept for explicit-intent uses. |
+| `make deploy-ai` | **Yes** | Auto-detects CloudFront URL from SSM, preserves CORS wiring. Standalone — does not touch `data`/`api`/`network`. |
+| `make delete-ai` | **Yes** | Tears down the AI stack and removes its SSM URL parameter. Frontend AI features show a friendly "set VITE_AI_API_URL" error until the stack is back. |
+| `make wire-frontend` | Yes (after `deploy-frontend`) | Forces re-application of the CloudFront URL to auth + api + ai (if deployed). Errors clearly if frontend not yet deployed. Mostly redundant now that the per-stack targets auto-detect, but kept for explicit-intent uses. |
 | `make sync-frontend` | Yes | Generates `.env.local` from SSM, builds, syncs to S3, invalidates CloudFront. |
 | `make deploy-bastion` / `make destroy-bastion` | Yes | Symmetric. `destroy-bastion` only removes bastion-specific resources — never touches the other stacks. |
 
@@ -249,6 +252,7 @@ job-tracker/
 │   ├── auth/                   # Cognito stack
 │   ├── api/                    # API Gateway + Lambdas stack
 │   ├── frontend/               # CloudFront + SPA bucket stack
+│   ├── ai/                     # Bedrock-backed AI Lambdas stack (no VPC)
 │   ├── bastion/                # transient EC2 for SSM port-forward to RDS
 │   ├── scripts/tunnel.sh       # opens SSM port-forward to RDS via bastion
 │   ├── shared/ssm-naming.md    # cross-stack SSM convention
@@ -258,7 +262,7 @@ job-tracker/
 │   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), users, logger
 │   │   ├── handlers/           # Lambda entrypoints (health, migrate, post_confirmation,
 │   │   │                       #   targets, dashboard, companies, submissions, resumes,
-│   │   │                       #   contacts)
+│   │   │                       #   contacts, ai_mine, ai_tailor)
 │   │   ├── migrations/         # forward-only SQL files run by handlers/migrate.py
 │   │   └── requirements.txt    # runtime deps for sam build
 │   ├── tests/                  # pytest unit tests (one test_<handler>.py per Lambda)
@@ -266,9 +270,9 @@ job-tracker/
 ├── frontend/                   # React + Vite + react-bootstrap + react-oidc-context
 │   ├── src/
 │   │   ├── auth/config.ts      # OIDC config + Cognito logout helper
-│   │   ├── api/client.ts       # useApi() hook — fetch with bearer token
+│   │   ├── api/client.ts       # useApi() hook — fetch with bearer token, routes /ai/* to AI stack URL
 │   │   ├── layout/AppShell.tsx # navbar + sidebar shell wrapping all routed pages
-│   │   ├── components/         # cross-page UI: PdfDropZone (drag-drop + browse + validation)
+│   │   ├── components/         # cross-page UI: PdfDropZone, pdfText (lazy-loaded pdfjs-dist extractor)
 │   │   ├── pages/              # Dashboard, Submissions, SubmissionDetail, SubmissionForm,
 │   │   │                       #   Companies, CompanyDetail, Resumes, ResumeDetail, ResumeForm,
 │   │   │                       #   ResumeUploadModal, Contacts, ContactDetail, ContactForm,
@@ -295,10 +299,11 @@ job-tracker/
 
 These are tracked for follow-up plans and have stack-shaped homes ready for them:
 
-- AI integration (Bedrock VPC endpoint + AI Lambdas) — `ai` stack
 - Email pipeline (SES inbound + processor Lambda) — `email` stack
 - Follow-up reminder scheduler (EventBridge + Lambda + SES outbound) — `scheduler` stack
 - Custom domain (Route 53, ACM us-east-1, CloudFront alias, Cognito custom domain, API Gateway custom domain) — `domain` stack
 - CI/CD via GitHub Actions (OIDC trust + deploy role) — `ci` stack + `.github/workflows/`
 - Responses CRUD + UI (lands with the `email` stack — responses are inbound-email-driven)
+- AI response classification (lands with the `email` stack — needs the inbound email body, which doesn't exist yet)
+- Structured-resume PDF rendering with tailored overrides (slice 06 punted in favor of copy-paste MVP)
 - DLQs, alarms, dashboards, WAF

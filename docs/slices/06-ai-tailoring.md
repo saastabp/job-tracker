@@ -1,6 +1,65 @@
-# Slice 06 — AI integration: resume tailoring + PDF mining (PLAN)
+# Slice 06 — AI integration: resume tailoring + PDF mining
 
-Status: planned, not started. Branch: `slice/06-ai-tailoring` (TBD).
+Status: implemented. Branch: `slice/06-ai-tailoring`.
+
+## What landed
+
+- New SAM stack `infra/ai/` (`template.yaml` + `samconfig.toml`).
+  Two non-VPC Lambdas (`jobtracker-ai-mine`, `jobtracker-ai-tailor`),
+  Bedrock `InvokeModel` policy scoped to `anthropic.*` foundation models
+  + cross-region inference profiles. Own HttpApi with the same Cognito
+  JWT authorizer config the api stack uses (read from SSM, no CFN
+  exports — keeps the AI stack tearable-down per `feedback_stacks`).
+- Makefile: `deploy-ai` / `delete-ai` standalone targets,
+  `gen-frontend-env` writes `VITE_AI_API_URL`, `wire-frontend` re-applies
+  CORS to the AI stack only when it exists, `deploy-all` includes ai.
+- `backend/src/handlers/ai_mine.py` + `ai_tailor.py` using
+  `AnthropicBedrock` (matches the regular Anthropic SDK surface so a
+  swap is a 2-line change). Haiku 4.5 inference profile
+  (`us.anthropic.claude-haiku-4-5-20251001-v1:0`). Custom
+  `_AiServiceError` distinguishes "model returned garbage" (502) from
+  "user input bad" (400).
+- `backend/tests/unit/test_ai_mine.py` (7 tests),
+  `test_ai_tailor.py` (10 tests). Patches the bedrock client; asserts
+  prompt construction carries master fields verbatim, fenced-JSON
+  parsing, parse failures and empty-field outputs both map to 502.
+- Frontend:
+  - `frontend/src/api/client.ts` routes `/ai/*` paths to
+    `VITE_AI_API_URL`. Friendly error if AI stack not yet deployed.
+  - `frontend/src/components/pdfText.ts` — pdfjs-dist text extraction,
+    lazy-imported on first use so the ~480 KB pdfjs payload doesn't
+    bloat the SPA initial bundle.
+  - `ResumeForm.tsx` auto-prefill: drop a PDF with blank title/summary
+    → pdfjs extracts text → POST `/ai/mine-resume` → fields populate
+    with an "auto-filled — edit if needed" badge.
+  - `SubmissionDetail.tsx` "Tailor with AI" button: pulls the master
+    resume's title+summary + the JD text, POSTs `/ai/tailor`,
+    populates the tailored fields. User reviews + saves (suggest-only,
+    fork 2).
+
+## Forks resolved
+
+1. PDF extraction — **client-side via pdfjs-dist** (recommended path
+   accepted). Lambda stays text-only, no S3 read or PDF library.
+2. Tailored output — **suggest-only** (recommended path accepted). User
+   can re-roll without polluting the row.
+3. Final tailored PDF — **MVP copy-paste** (recommended path accepted).
+   Structured-resume rendering deferred indefinitely.
+
+## Out of scope (still deferred)
+
+- AI response classification (lands with `email` stack).
+- Tailoring multi-section experience bullets (locked OFF per
+  `project_ai_tailoring`).
+- Structured-resume PDF rendering.
+
+---
+
+# Original plan
+
+(below for reference)
+
+
 
 ## Why this slice
 

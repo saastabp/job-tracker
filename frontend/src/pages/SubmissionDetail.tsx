@@ -59,6 +59,7 @@ interface SubmissionDetail {
 interface ResumeOption {
   id: number;
   title: string | null;
+  summary: string | null;
   is_master: boolean;
 }
 
@@ -78,6 +79,8 @@ export default function SubmissionDetail() {
   const [editJdText, setEditJdText] = useState('');
   const [editingRoleTitle, setEditingRoleTitle] = useState(false);
   const [roleTitleDraft, setRoleTitleDraft] = useState('');
+  const [tailorBusy, setTailorBusy] = useState(false);
+  const [tailorMessage, setTailorMessage] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -109,12 +112,53 @@ export default function SubmissionDetail() {
           rows.map((r: any) => ({
             id: r.id,
             title: r.title,
+            summary: r.summary,
             is_master: r.is_master,
           })),
         ),
       )
       .catch(() => setResumes([]));
   }, [apiFetch]);
+
+  async function handleTailor() {
+    if (!data) return;
+    setTailorMessage(null);
+    const master = resumes.find((r) => r.is_master);
+    if (!master?.title || !master?.summary) {
+      setTailorMessage(
+        'Set a master resume with both a title and a summary before tailoring.',
+      );
+      return;
+    }
+    if (!editJdText.trim()) {
+      setTailorMessage(
+        'Paste the job description into the field below before tailoring.',
+      );
+      return;
+    }
+    setTailorBusy(true);
+    try {
+      const r = await apiFetch('/ai/tailor', {
+        method: 'POST',
+        body: JSON.stringify({
+          master_title: master.title,
+          master_summary: master.summary,
+          jd_text: editJdText,
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const { tailored_title, tailored_summary } = await r.json();
+      setEditTailoredTitle(tailored_title);
+      setEditTailoredSummary(tailored_summary);
+      setTailorMessage(
+        'AI suggestion loaded into the tailored fields below. Review, edit, then Save changes.',
+      );
+    } catch (e) {
+      setTailorMessage(`Tailoring failed: ${String(e)}`);
+    } finally {
+      setTailorBusy(false);
+    }
+  }
 
   function startEditingRoleTitle() {
     setRoleTitleDraft(data?.role_title ?? '');
@@ -324,13 +368,21 @@ export default function SubmissionDetail() {
               <hr />
               <Card.Subtitle className="text-muted mb-2">Actions</Card.Subtitle>
               <div className="d-flex gap-2 flex-wrap">
-                <Button variant="outline-primary" size="sm" disabled>
-                  Tailor with AI <Badge bg="light" text="dark">slice 06</Badge>
+                <Button
+                  variant="outline-primary"
+                  size="sm"
+                  onClick={handleTailor}
+                  disabled={tailorBusy}
+                >
+                  {tailorBusy ? 'Tailoring…' : 'Tailor with AI'}
                 </Button>
                 <Button variant="outline-secondary" size="sm" disabled>
                   Trigger follow-up <Badge bg="light" text="dark">slice 08</Badge>
                 </Button>
               </div>
+              {tailorMessage && (
+                <div className="text-muted small mt-2">{tailorMessage}</div>
+              )}
             </Card.Body>
           </Card>
         </Col>

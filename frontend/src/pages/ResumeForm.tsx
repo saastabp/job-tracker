@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Modal, Form, Button, Alert, Row, Col } from 'react-bootstrap';
+import { Modal, Form, Button, Alert, Row, Col, Badge } from 'react-bootstrap';
 import { useApi } from '../api/client';
 import PdfDropZone, { PDF_MAX_BYTES, formatFileSize } from '../components/PdfDropZone';
 
@@ -11,25 +11,74 @@ interface Props {
   suggestMaster?: boolean;
 }
 
+type FieldOrigin = 'user' | 'ai';
+
 export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: Props) {
   const apiFetch = useApi();
   const [title, setTitle] = useState('');
   const [summary, setSummary] = useState('');
+  const [titleOrigin, setTitleOrigin] = useState<FieldOrigin>('user');
+  const [summaryOrigin, setSummaryOrigin] = useState<FieldOrigin>('user');
   const [isMaster, setIsMaster] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiHint, setAiHint] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (show) {
       setTitle('');
       setSummary('');
+      setTitleOrigin('user');
+      setSummaryOrigin('user');
       setIsMaster(false);
       setFile(null);
       setProgress(null);
+      setAiBusy(false);
+      setAiHint(null);
       setError(null);
     }
   }, [show]);
+
+  async function handleFileChange(f: File | null) {
+    setFile(f);
+    if (!f) return;
+    if (title.trim() || summary.trim()) {
+      // Don't clobber what the user has already typed.
+      setAiHint('PDF set. Title/summary already filled — AI auto-prefill skipped.');
+      return;
+    }
+
+    setAiBusy(true);
+    setAiHint('Reading PDF…');
+    try {
+      // Lazy import: pdfjs-dist + its worker only ship when a user actually
+      // drops a PDF, keeping the initial SPA bundle lean.
+      const { extractPdfText } = await import('../components/pdfText');
+      const text = await extractPdfText(f);
+      if (!text.trim()) throw new Error('PDF appeared to contain no extractable text');
+      setAiHint('Asking AI for a title + summary…');
+      const r = await apiFetch('/ai/mine-resume', {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt}`);
+      }
+      const { title: aiTitle, summary: aiSummary } = await r.json();
+      setTitle(aiTitle);
+      setSummary(aiSummary);
+      setTitleOrigin('ai');
+      setSummaryOrigin('ai');
+      setAiHint('Auto-filled from your PDF — review and edit before saving.');
+    } catch (err) {
+      setAiHint(`Couldn't auto-fill from PDF (${String(err)}). Fill in manually.`);
+    } finally {
+      setAiBusy(false);
+    }
+  }
 
   async function uploadFile(resumeId: number, f: File) {
     setProgress('Requesting upload URL…');
@@ -85,7 +134,7 @@ export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: P
     }
   }
 
-  const busy = progress !== null;
+  const busy = progress !== null || aiBusy;
 
   return (
     <Modal
@@ -109,11 +158,19 @@ export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: P
           <Row className="g-3">
             <Col md={12}>
               <Form.Group>
-                <Form.Label>Title</Form.Label>
+                <Form.Label className="d-flex align-items-center gap-2">
+                  Title
+                  {titleOrigin === 'ai' && (
+                    <Badge bg="info">auto-filled — edit if needed</Badge>
+                  )}
+                </Form.Label>
                 <Form.Control
                   required
                   value={title}
-                  onChange={(e) => setTitle(e.target.value)}
+                  onChange={(e) => {
+                    setTitle(e.target.value);
+                    setTitleOrigin('user');
+                  }}
                   placeholder="e.g., Master — SRE / Platform Engineering"
                   disabled={busy}
                 />
@@ -124,12 +181,20 @@ export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: P
             </Col>
             <Col md={12}>
               <Form.Group>
-                <Form.Label>Summary</Form.Label>
+                <Form.Label className="d-flex align-items-center gap-2">
+                  Summary
+                  {summaryOrigin === 'ai' && (
+                    <Badge bg="info">auto-filled — edit if needed</Badge>
+                  )}
+                </Form.Label>
                 <Form.Control
                   as="textarea"
                   rows={6}
                   value={summary}
-                  onChange={(e) => setSummary(e.target.value)}
+                  onChange={(e) => {
+                    setSummary(e.target.value);
+                    setSummaryOrigin('user');
+                  }}
                   placeholder="Paste your master summary / professional statement here."
                   disabled={busy}
                 />
@@ -143,13 +208,17 @@ export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: P
                 <Form.Label>PDF (optional)</Form.Label>
                 <PdfDropZone
                   file={file}
-                  onFile={setFile}
+                  onFile={handleFileChange}
                   onError={setError}
                   disabled={busy}
                 />
                 <Form.Text className="d-block mt-2 text-muted">
                   PDF only, max {formatFileSize(PDF_MAX_BYTES)}. You can upload later from the detail page.
+                  Dropping a PDF here while title/summary are blank will ask AI for a starting point.
                 </Form.Text>
+                {aiHint && (
+                  <div className="text-muted small mt-2">{aiHint}</div>
+                )}
               </Form.Group>
             </Col>
             {!suggestMaster && (

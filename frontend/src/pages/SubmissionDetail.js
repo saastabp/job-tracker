@@ -21,6 +21,8 @@ export default function SubmissionDetail() {
     const [editJdText, setEditJdText] = useState('');
     const [editingRoleTitle, setEditingRoleTitle] = useState(false);
     const [roleTitleDraft, setRoleTitleDraft] = useState('');
+    const [tailorBusy, setTailorBusy] = useState(false);
+    const [tailorMessage, setTailorMessage] = useState(null);
     const load = useCallback(async () => {
         try {
             const r = await apiFetch(`/submissions/${id}`);
@@ -49,10 +51,48 @@ export default function SubmissionDetail() {
             .then((rows) => setResumes(rows.map((r) => ({
             id: r.id,
             title: r.title,
+            summary: r.summary,
             is_master: r.is_master,
         }))))
             .catch(() => setResumes([]));
     }, [apiFetch]);
+    async function handleTailor() {
+        if (!data)
+            return;
+        setTailorMessage(null);
+        const master = resumes.find((r) => r.is_master);
+        if (!master?.title || !master?.summary) {
+            setTailorMessage('Set a master resume with both a title and a summary before tailoring.');
+            return;
+        }
+        if (!editJdText.trim()) {
+            setTailorMessage('Paste the job description into the field below before tailoring.');
+            return;
+        }
+        setTailorBusy(true);
+        try {
+            const r = await apiFetch('/ai/tailor', {
+                method: 'POST',
+                body: JSON.stringify({
+                    master_title: master.title,
+                    master_summary: master.summary,
+                    jd_text: editJdText,
+                }),
+            });
+            if (!r.ok)
+                throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            const { tailored_title, tailored_summary } = await r.json();
+            setEditTailoredTitle(tailored_title);
+            setEditTailoredSummary(tailored_summary);
+            setTailorMessage('AI suggestion loaded into the tailored fields below. Review, edit, then Save changes.');
+        }
+        catch (e) {
+            setTailorMessage(`Tailoring failed: ${String(e)}`);
+        }
+        finally {
+            setTailorBusy(false);
+        }
+    }
     function startEditingRoleTitle() {
         setRoleTitleDraft(data?.role_title ?? '');
         setEditingRoleTitle(true);
@@ -141,7 +181,7 @@ export default function SubmissionDetail() {
                             else if (e.key === 'Escape') {
                                 setEditingRoleTitle(false);
                             }
-                        }, disabled: savingField === 'role_title', placeholder: "Role title", style: { maxWidth: 480 } })) : (_jsx("h3", { className: "mb-0", onClick: startEditingRoleTitle, title: "Click to edit", style: { cursor: 'pointer' }, children: data.role_title || (_jsx("span", { className: "text-muted", children: "Untitled role" })) })), _jsx("span", { className: "ms-3", children: _jsx(StatusBadge, { status: data.status }) })] }), error && _jsx(Alert, { variant: "danger", children: error }), _jsxs(Row, { className: "g-3 mb-3", children: [_jsx(Col, { md: 6, children: _jsx(Card, { children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Company" }), data.company_id ? (_jsx(Link, { to: `/companies/${data.company_id}`, children: data.company_name })) : (_jsx("span", { className: "text-muted", children: "\u2014" })), _jsx("hr", {}), _jsxs(Form.Group, { className: "mb-3", children: [_jsx(Form.Label, { className: "text-muted small mb-1", children: "Submitted on" }), _jsx(Form.Control, { type: "date", value: editSubmittedOn, onChange: (e) => setEditSubmittedOn(e.target.value) })] }), _jsxs(Form.Group, { children: [_jsx(Form.Label, { className: "text-muted small mb-1", children: "Link to Job Description" }), _jsx(Form.Control, { type: "url", value: editJdUrl, onChange: (e) => setEditJdUrl(e.target.value), placeholder: "https://..." }), data.jd_url && (_jsx(Form.Text, { children: _jsx("a", { href: data.jd_url, target: "_blank", rel: "noreferrer", children: "Open current link" }) }))] })] }) }) }), _jsx(Col, { md: 6, children: _jsx(Card, { children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Status" }), _jsx(Form.Select, { value: data.status, disabled: savingField === 'status', onChange: (e) => patchField('status', e.target.value, 'status'), children: STATUSES.map((s) => (_jsx("option", { value: s.short_name, children: s.label }, s.short_name))) }), _jsx("hr", {}), _jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Resume" }), _jsxs(Form.Select, { value: data.resume_id ?? '', disabled: savingField === 'resume_id', onChange: (e) => patchField('resume_id', e.target.value ? Number(e.target.value) : null, 'resume_id'), children: [_jsx("option", { value: "", children: "\u2014 none \u2014" }), resumes.map((r) => (_jsxs("option", { value: r.id, children: [r.title || `Resume #${r.id}`, r.is_master ? ' (master)' : ''] }, r.id)))] }), data.resume_id && (_jsx("div", { className: "mt-1 small", children: _jsxs(Link, { to: `/resumes/${data.resume_id}`, children: ["Open ", data.resume_title || `resume #${data.resume_id}`] }) })), _jsx("hr", {}), _jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Actions" }), _jsxs("div", { className: "d-flex gap-2 flex-wrap", children: [_jsxs(Button, { variant: "outline-primary", size: "sm", disabled: true, children: ["Tailor with AI ", _jsx(Badge, { bg: "light", text: "dark", children: "slice 06" })] }), _jsxs(Button, { variant: "outline-secondary", size: "sm", disabled: true, children: ["Trigger follow-up ", _jsx(Badge, { bg: "light", text: "dark", children: "slice 08" })] })] })] }) }) })] }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Notes" }), _jsx(Form.Control, { as: "textarea", rows: 3, value: editNotes, onChange: (e) => setEditNotes(e.target.value) })] }) }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsxs("div", { className: "d-flex justify-content-between align-items-center mb-2", children: [_jsx(Card.Subtitle, { className: "text-muted", children: "Job Description" }), data.jd_snapshot && (_jsx(Button, { variant: "link", size: "sm", onClick: () => setShowJd((v) => !v), children: showJd ? 'Collapse' : 'Expand' }))] }), _jsx(Collapse, { in: showJd || !data.jd_snapshot, children: _jsxs("div", { children: [_jsx(Form.Control, { as: "textarea", rows: data.jd_snapshot ? 16 : 6, value: editJdText, onChange: (e) => setEditJdText(e.target.value), placeholder: "Paste the job description body here. Archived to S3 on save.", style: { fontFamily: 'monospace' } }), _jsx(Form.Text, { className: "text-muted", children: "Used as input to AI tailoring later. Leaving this empty clears the saved snapshot." })] }) })] }) }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Tailored title / summary" }), _jsxs(Form.Group, { className: "mb-3", children: [_jsx(Form.Label, { children: "Tailored title" }), _jsx(Form.Control, { value: editTailoredTitle, onChange: (e) => setEditTailoredTitle(e.target.value) })] }), _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Tailored summary" }), _jsx(Form.Control, { as: "textarea", rows: 4, value: editTailoredSummary, onChange: (e) => setEditTailoredSummary(e.target.value) })] })] }) }), _jsx("div", { className: "mb-3", children: _jsx(Button, { onClick: handleSave, disabled: savingField === 'save' ||
+                        }, disabled: savingField === 'role_title', placeholder: "Role title", style: { maxWidth: 480 } })) : (_jsx("h3", { className: "mb-0", onClick: startEditingRoleTitle, title: "Click to edit", style: { cursor: 'pointer' }, children: data.role_title || (_jsx("span", { className: "text-muted", children: "Untitled role" })) })), _jsx("span", { className: "ms-3", children: _jsx(StatusBadge, { status: data.status }) })] }), error && _jsx(Alert, { variant: "danger", children: error }), _jsxs(Row, { className: "g-3 mb-3", children: [_jsx(Col, { md: 6, children: _jsx(Card, { children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Company" }), data.company_id ? (_jsx(Link, { to: `/companies/${data.company_id}`, children: data.company_name })) : (_jsx("span", { className: "text-muted", children: "\u2014" })), _jsx("hr", {}), _jsxs(Form.Group, { className: "mb-3", children: [_jsx(Form.Label, { className: "text-muted small mb-1", children: "Submitted on" }), _jsx(Form.Control, { type: "date", value: editSubmittedOn, onChange: (e) => setEditSubmittedOn(e.target.value) })] }), _jsxs(Form.Group, { children: [_jsx(Form.Label, { className: "text-muted small mb-1", children: "Link to Job Description" }), _jsx(Form.Control, { type: "url", value: editJdUrl, onChange: (e) => setEditJdUrl(e.target.value), placeholder: "https://..." }), data.jd_url && (_jsx(Form.Text, { children: _jsx("a", { href: data.jd_url, target: "_blank", rel: "noreferrer", children: "Open current link" }) }))] })] }) }) }), _jsx(Col, { md: 6, children: _jsx(Card, { children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Status" }), _jsx(Form.Select, { value: data.status, disabled: savingField === 'status', onChange: (e) => patchField('status', e.target.value, 'status'), children: STATUSES.map((s) => (_jsx("option", { value: s.short_name, children: s.label }, s.short_name))) }), _jsx("hr", {}), _jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Resume" }), _jsxs(Form.Select, { value: data.resume_id ?? '', disabled: savingField === 'resume_id', onChange: (e) => patchField('resume_id', e.target.value ? Number(e.target.value) : null, 'resume_id'), children: [_jsx("option", { value: "", children: "\u2014 none \u2014" }), resumes.map((r) => (_jsxs("option", { value: r.id, children: [r.title || `Resume #${r.id}`, r.is_master ? ' (master)' : ''] }, r.id)))] }), data.resume_id && (_jsx("div", { className: "mt-1 small", children: _jsxs(Link, { to: `/resumes/${data.resume_id}`, children: ["Open ", data.resume_title || `resume #${data.resume_id}`] }) })), _jsx("hr", {}), _jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Actions" }), _jsxs("div", { className: "d-flex gap-2 flex-wrap", children: [_jsx(Button, { variant: "outline-primary", size: "sm", onClick: handleTailor, disabled: tailorBusy, children: tailorBusy ? 'Tailoring…' : 'Tailor with AI' }), _jsxs(Button, { variant: "outline-secondary", size: "sm", disabled: true, children: ["Trigger follow-up ", _jsx(Badge, { bg: "light", text: "dark", children: "slice 08" })] })] }), tailorMessage && (_jsx("div", { className: "text-muted small mt-2", children: tailorMessage }))] }) }) })] }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Notes" }), _jsx(Form.Control, { as: "textarea", rows: 3, value: editNotes, onChange: (e) => setEditNotes(e.target.value) })] }) }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsxs("div", { className: "d-flex justify-content-between align-items-center mb-2", children: [_jsx(Card.Subtitle, { className: "text-muted", children: "Job Description" }), data.jd_snapshot && (_jsx(Button, { variant: "link", size: "sm", onClick: () => setShowJd((v) => !v), children: showJd ? 'Collapse' : 'Expand' }))] }), _jsx(Collapse, { in: showJd || !data.jd_snapshot, children: _jsxs("div", { children: [_jsx(Form.Control, { as: "textarea", rows: data.jd_snapshot ? 16 : 6, value: editJdText, onChange: (e) => setEditJdText(e.target.value), placeholder: "Paste the job description body here. Archived to S3 on save.", style: { fontFamily: 'monospace' } }), _jsx(Form.Text, { className: "text-muted", children: "Used as input to AI tailoring later. Leaving this empty clears the saved snapshot." })] }) })] }) }), _jsx(Card, { className: "mb-3", children: _jsxs(Card.Body, { children: [_jsx(Card.Subtitle, { className: "text-muted mb-2", children: "Tailored title / summary" }), _jsxs(Form.Group, { className: "mb-3", children: [_jsx(Form.Label, { children: "Tailored title" }), _jsx(Form.Control, { value: editTailoredTitle, onChange: (e) => setEditTailoredTitle(e.target.value) })] }), _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Tailored summary" }), _jsx(Form.Control, { as: "textarea", rows: 4, value: editTailoredSummary, onChange: (e) => setEditTailoredSummary(e.target.value) })] })] }) }), _jsx("div", { className: "mb-3", children: _jsx(Button, { onClick: handleSave, disabled: savingField === 'save' ||
                         (editNotes === (data.notes ?? '') &&
                             editTailoredTitle === (data.tailored_title ?? '') &&
                             editTailoredSummary === (data.tailored_summary ?? '') &&
