@@ -93,3 +93,29 @@ def test_dashboard_empty_user(mocker, patched_conn, mock_cursor, auth_event, lam
     assert m["recruiter_outreach"] == {"today": 0, "week": 0, "daily": None, "weekly": None}
     assert m["follow_ups"] == {"pending": 0, "daily": None, "weekly": None}
     assert body["recent_submissions"] == []
+
+
+def test_outreach_query_filters_to_outbound(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Inbound outreach (e.g. an unsolicited recruiter ping) must not inflate
+    the user's outreach widgets. The dashboard counts outbound events only."""
+    from handlers import dashboard
+
+    patched_conn("handlers.dashboard")
+    mocker.patch("handlers.dashboard.get_user_id", return_value=42)
+
+    mock_cursor.fetchone.side_effect = [
+        {"today_count": 0, "week_count": 0},
+        {"pending": 0},
+        {"today": "2026-04-29", "week_start": "2026-04-27"},
+    ]
+    mock_cursor.fetchall.side_effect = [[], [], []]
+
+    resp = dashboard.handler(auth_event("GET /dashboard/today"), lambda_ctx)
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    outreach_sql = next(s for s in sql_calls if "FROM contact_outreach" in s)
+    assert "outreach_directions od" in outreach_sql
+    assert "od.short_name = 'outbound'" in outreach_sql

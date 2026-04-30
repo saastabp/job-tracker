@@ -327,6 +327,73 @@ Resources:
             Path: /submissions/{id}
             Method: PUT
 
+  ContactsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-contacts
+      CodeUri: ../../backend/src
+      Handler: handlers.contacts.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        ListContacts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts
+            Method: GET
+        CreateContact:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts
+            Method: POST
+        GetContact:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{id}
+            Method: GET
+        UpdateContact:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{id}
+            Method: PUT
+        DeleteContact:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{id}
+            Method: DELETE
+        LogOutreach:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{id}/outreach
+            Method: POST
+        DeleteOutreach:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{contact_id}/outreach/{id}
+            Method: DELETE
+
   ResumesFunction:
     Type: AWS::Serverless::Function
     Properties:

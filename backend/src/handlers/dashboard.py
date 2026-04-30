@@ -65,6 +65,9 @@ def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
         metrics["submissions"]["today"] = int(row.get("today_count") or 0)
         metrics["submissions"]["week"] = int(row.get("week_count") or 0)
 
+        # Only outbound events count toward the user's outreach targets —
+        # inbound recruiter pings are tracked but shouldn't inflate the
+        # "did I reach out enough this week?" widgets.
         cur.execute(
             """
             SELECT
@@ -72,9 +75,12 @@ def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
                 SUM(CASE WHEN DATE(co.outreach_at) = CURDATE() THEN 1 ELSE 0 END) AS today_count,
                 SUM(CASE WHEN YEARWEEK(co.outreach_at, 1) = YEARWEEK(CURDATE(), 1) THEN 1 ELSE 0 END) AS week_count
             FROM contact_outreach co
-            JOIN contacts c       ON c.id = co.contact_id AND c.deleted_at IS NULL
-            JOIN contact_kinds ck ON ck.id = c.contact_kind_id
-            WHERE co.user_id = %s AND co.deleted_at IS NULL
+            JOIN contacts c             ON c.id = co.contact_id AND c.deleted_at IS NULL
+            JOIN contact_kinds ck       ON ck.id = c.contact_kind_id
+            JOIN outreach_directions od ON od.id = co.outreach_direction_id
+            WHERE co.user_id = %s
+              AND co.deleted_at IS NULL
+              AND od.short_name = 'outbound'
             GROUP BY ck.short_name
             """,
             (user_id,),

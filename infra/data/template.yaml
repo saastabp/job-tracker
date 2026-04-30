@@ -33,12 +33,6 @@ Resources:
       DBInstanceIdentifier: jobtracker-db
       Engine: mysql
       EngineVersion: '8.4'
-      # TODO(post-upgrade): remove this line after `make deploy-data` finishes the
-      # 8.0 -> 8.4 upgrade. RDS classifies 8.0 -> 8.4 as a major upgrade (LTS-to-LTS
-      # crossing with breaking changes — auth plugin default, removed features) so
-      # the flag is required to permit it. Removing it afterward restores the
-      # explicit-opt-in gate; future major-version changes need the flag re-added.
-      AllowMajorVersionUpgrade: true
       DBInstanceClass: !Ref DbInstanceClass
       AllocatedStorage: 20
       StorageType: gp3

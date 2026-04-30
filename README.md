@@ -257,7 +257,8 @@ job-tracker/
 │   ├── src/
 │   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), users, logger
 │   │   ├── handlers/           # Lambda entrypoints (health, migrate, post_confirmation,
-│   │   │                       #   targets, dashboard, companies, submissions, resumes)
+│   │   │                       #   targets, dashboard, companies, submissions, resumes,
+│   │   │                       #   contacts)
 │   │   ├── migrations/         # forward-only SQL files run by handlers/migrate.py
 │   │   └── requirements.txt    # runtime deps for sam build
 │   ├── tests/                  # pytest unit tests (one test_<handler>.py per Lambda)
@@ -270,7 +271,8 @@ job-tracker/
 │   │   ├── components/         # cross-page UI: PdfDropZone (drag-drop + browse + validation)
 │   │   ├── pages/              # Dashboard, Submissions, SubmissionDetail, SubmissionForm,
 │   │   │                       #   Companies, CompanyDetail, Resumes, ResumeDetail, ResumeForm,
-│   │   │                       #   ResumeUploadModal, Targets, Health, Login, ComingSoon
+│   │   │                       #   ResumeUploadModal, Contacts, ContactDetail, ContactForm,
+│   │   │                       #   Targets, Health, Login, ComingSoon
 │   │   ├── App.tsx
 │   │   └── main.tsx
 │   ├── index.html
