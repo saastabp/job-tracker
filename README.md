@@ -1,8 +1,8 @@
-# job-tracker
+# Job Search Tracker
 
 Web app for tracking job-search activity (resume submissions, responses, follow-ups, daily/weekly targets), built as an AWS-native serverless reference architecture.
 
-The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), and submissions + companies CRUD with JD-snapshot archival to S3 (slice 03). Remaining business features (AI-assisted resume tailoring, SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
+The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), submissions + companies CRUD with JD-snapshot archival to S3 (slice 03), and resumes CRUD with browser-direct presigned-PUT uploads + submission linking (slice 04). Remaining business features (AI-assisted resume tailoring, SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
 
 ## Architecture
 
@@ -257,7 +257,7 @@ job-tracker/
 │   ├── src/
 │   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), users, logger
 │   │   ├── handlers/           # Lambda entrypoints (health, migrate, post_confirmation,
-│   │   │                       #   targets, dashboard, companies, submissions)
+│   │   │                       #   targets, dashboard, companies, submissions, resumes)
 │   │   ├── migrations/         # forward-only SQL files run by handlers/migrate.py
 │   │   └── requirements.txt    # runtime deps for sam build
 │   ├── tests/                  # pytest unit tests (one test_<handler>.py per Lambda)
@@ -267,8 +267,10 @@ job-tracker/
 │   │   ├── auth/config.ts      # OIDC config + Cognito logout helper
 │   │   ├── api/client.ts       # useApi() hook — fetch with bearer token
 │   │   ├── layout/AppShell.tsx # navbar + sidebar shell wrapping all routed pages
+│   │   ├── components/         # cross-page UI: PdfDropZone (drag-drop + browse + validation)
 │   │   ├── pages/              # Dashboard, Submissions, SubmissionDetail, SubmissionForm,
-│   │   │                       #   Companies, CompanyDetail, Targets, Health, Login, ComingSoon
+│   │   │                       #   Companies, CompanyDetail, Resumes, ResumeDetail, ResumeForm,
+│   │   │                       #   ResumeUploadModal, Targets, Health, Login, ComingSoon
 │   │   ├── App.tsx
 │   │   └── main.tsx
 │   ├── index.html

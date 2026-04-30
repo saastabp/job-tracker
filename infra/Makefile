@@ -142,7 +142,11 @@ sync-frontend: gen-frontend-env
 	DIST=$$(aws ssm get-parameter --name /jobtracker/frontend/distribution-id \
 		--query 'Parameter.Value' --output text --region $(REGION)) && \
 	aws s3 sync $(ROOT)/frontend/dist/ s3://$$BUCKET/ --delete --region $(REGION) && \
-	aws cloudfront create-invalidation --distribution-id $$DIST --paths '/*'
+	INV_ID=$$(aws cloudfront create-invalidation --distribution-id $$DIST --paths '/*' \
+		--query 'Invalidation.Id' --output text) && \
+	echo "Invalidation $$INV_ID created; waiting for completion (CloudFront typically takes 1-5 min)..." && \
+	aws cloudfront wait invalidation-completed --distribution-id $$DIST --id $$INV_ID && \
+	echo "Invalidation $$INV_ID completed — fresh SPA is live."
 
 list-ssm:
 	aws ssm get-parameters-by-path --path /jobtracker --recursive \

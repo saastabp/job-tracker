@@ -32,7 +32,13 @@ Resources:
     Properties:
       DBInstanceIdentifier: jobtracker-db
       Engine: mysql
-      EngineVersion: '8.0'
+      EngineVersion: '8.4'
+      # TODO(post-upgrade): remove this line after `make deploy-data` finishes the
+      # 8.0 -> 8.4 upgrade. RDS classifies 8.0 -> 8.4 as a major upgrade (LTS-to-LTS
+      # crossing with breaking changes — auth plugin default, removed features) so
+      # the flag is required to permit it. Removing it afterward restores the
+      # explicit-opt-in gate; future major-version changes need the flag re-added.
+      AllowMajorVersionUpgrade: true
       DBInstanceClass: !Ref DbInstanceClass
       AllocatedStorage: 20
       StorageType: gp3
@@ -65,6 +71,19 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # Browser uploads via presigned PUT URLs (slice 04). The bucket stays
+      # private — CORS only governs the browser preflight; auth is the
+      # presigned-URL signature, time-limited (5 min) and bound to a single
+      # IAM-authorized PUT. AllowedOrigins=* is therefore safe and avoids
+      # coupling this stack to the CloudFront URL (which lives in SSM only
+      # after the frontend stack deploys).
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*']
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
       Tags:
         - { Key: Name, Value: jobtracker-resumes }
 

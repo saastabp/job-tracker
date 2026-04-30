@@ -88,7 +88,7 @@ def test_create_submission_with_company_name_and_jd(
         "id": 99, "role_title": "SRE",
         "submitted_on": "2026-04-28", "notes": None,
         "company_id": 88, "company_name": "Acme",
-        "resume_id": None,
+        "resume_id": None, "resume_title": None,
         "status": "applied",
         "tailored_title": None, "tailored_summary": None,
         "jd_url": "https://example.com/jd",
@@ -208,7 +208,7 @@ def test_update_submission(mocker, patched_conn, mock_cursor, auth_event, lambda
         "id": 99, "role_title": "SRE",
         "submitted_on": "2026-04-28", "notes": "updated",
         "company_id": None, "company_name": None,
-        "resume_id": None,
+        "resume_id": None, "resume_title": None,
         "status": "applied",
         "tailored_title": None, "tailored_summary": None,
         "jd_url": None,
@@ -253,6 +253,102 @@ def test_update_submission_not_found_returns_404(
     )
 
     assert resp["statusCode"] == 404
+
+
+def test_update_submission_jd_text_upserts_snapshot(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """PUT with jd_text writes to S3 and upserts jd_snapshots, even when no scalar fields change."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    s3 = mocker.patch.object(submissions, "_s3")
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": "https://example.com/jd",
+        "created_at": None, "updated_at": None,
+    }
+    snapshot_row = {
+        "id": 5,
+        "s3_key": "users/user-sub-1/submissions/99/jd.txt",
+        "source_url": "https://example.com/jd",
+        "captured_at": "2026-04-28 10:00:00",
+    }
+    # _update_jd reads existing jd_url, then _detail runs.
+    mock_cursor.fetchone.side_effect = [
+        {"jd_url": "https://example.com/jd"},  # _update_jd source_url lookup
+        submission_row,                         # _detail submission
+        snapshot_row,                           # _detail jd_snapshot
+    ]
+    s3.get_object.return_value = {
+        "Body": mocker.MagicMock(read=mocker.MagicMock(return_value=b"new jd body")),
+    }
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}",
+            path_id="99",
+            body={"jd_text": "new jd body"},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    s3.put_object.assert_called_once()
+    put_kwargs = s3.put_object.call_args.kwargs
+    assert put_kwargs["Body"] == b"new jd body"
+    # An upsert query against jd_snapshots fired.
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert any("INSERT INTO jd_snapshots" in s for s in sql_calls)
+
+
+def test_update_submission_empty_jd_text_clears_snapshot(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    mocker.patch.object(submissions, "_s3")
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [
+        {"jd_url": None},  # _update_jd source_url lookup
+        submission_row,    # _detail submission
+        None,              # _detail jd_snapshot (none, because we just cleared)
+    ]
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}",
+            path_id="99",
+            body={"jd_text": ""},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert any(
+        "UPDATE jd_snapshots SET deleted_at = CURRENT_TIMESTAMP" in s
+        for s in sql_calls
+    )
 
 
 def test_unknown_route_returns_404(mocker, patched_conn, auth_event, lambda_ctx):

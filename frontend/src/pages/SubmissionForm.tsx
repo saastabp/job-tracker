@@ -16,6 +16,12 @@ interface CompanyOption {
   name: string;
 }
 
+interface ResumeOption {
+  id: number;
+  title: string | null;
+  is_master: boolean;
+}
+
 interface Props {
   show: boolean;
   onHide: () => void;
@@ -29,6 +35,7 @@ function todayIso(): string {
 export default function SubmissionForm({ show, onHide, onCreated }: Props) {
   const apiFetch = useApi();
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
+  const [resumes, setResumes] = useState<ResumeOption[]>([]);
   const [companyName, setCompanyName] = useState('');
   const [roleTitle, setRoleTitle] = useState('');
   const [status, setStatus] = useState('applied');
@@ -36,6 +43,7 @@ export default function SubmissionForm({ show, onHide, onCreated }: Props) {
   const [jdUrl, setJdUrl] = useState('');
   const [jdText, setJdText] = useState('');
   const [notes, setNotes] = useState('');
+  const [resumeId, setResumeId] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,6 +53,20 @@ export default function SubmissionForm({ show, onHide, onCreated }: Props) {
       .then((r) => (r.ok ? r.json() : []))
       .then((rows) => setCompanies(rows.map((c: any) => ({ id: c.id, name: c.name }))))
       .catch(() => setCompanies([]));
+    apiFetch('/resumes')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        const opts: ResumeOption[] = rows.map((r: any) => ({
+          id: r.id,
+          title: r.title,
+          is_master: r.is_master,
+        }));
+        setResumes(opts);
+        // Default to the master resume if one exists.
+        const master = opts.find((r) => r.is_master);
+        if (master) setResumeId(String(master.id));
+      })
+      .catch(() => setResumes([]));
   }, [show, apiFetch]);
 
   function reset() {
@@ -55,6 +77,7 @@ export default function SubmissionForm({ show, onHide, onCreated }: Props) {
     setJdUrl('');
     setJdText('');
     setNotes('');
+    setResumeId('');
     setError(null);
   }
 
@@ -73,6 +96,7 @@ export default function SubmissionForm({ show, onHide, onCreated }: Props) {
           jd_url: jdUrl.trim() || undefined,
           jd_text: jdText || undefined,
           notes: notes || undefined,
+          resume_id: resumeId ? Number(resumeId) : undefined,
         }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
@@ -155,6 +179,27 @@ export default function SubmissionForm({ show, onHide, onCreated }: Props) {
                   onChange={(e) => setJdUrl(e.target.value)}
                   placeholder="https://..."
                 />
+              </Form.Group>
+            </Col>
+            <Col md={12}>
+              <Form.Group>
+                <Form.Label>Resume</Form.Label>
+                <Form.Select
+                  value={resumeId}
+                  onChange={(e) => setResumeId(e.target.value)}
+                >
+                  <option value="">— none —</option>
+                  {resumes.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.title || `Resume #${r.id}`}
+                      {r.is_master ? ' (master)' : ''}
+                    </option>
+                  ))}
+                </Form.Select>
+                <Form.Text className="text-muted">
+                  Defaults to your master resume. Manage at{' '}
+                  <strong>Resumes</strong> in the sidebar.
+                </Form.Text>
               </Form.Group>
             </Col>
             <Col md={12}>

@@ -16,6 +16,7 @@ function todayIso() {
 export default function SubmissionForm({ show, onHide, onCreated }) {
     const apiFetch = useApi();
     const [companies, setCompanies] = useState([]);
+    const [resumes, setResumes] = useState([]);
     const [companyName, setCompanyName] = useState('');
     const [roleTitle, setRoleTitle] = useState('');
     const [status, setStatus] = useState('applied');
@@ -23,6 +24,7 @@ export default function SubmissionForm({ show, onHide, onCreated }) {
     const [jdUrl, setJdUrl] = useState('');
     const [jdText, setJdText] = useState('');
     const [notes, setNotes] = useState('');
+    const [resumeId, setResumeId] = useState('');
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState(null);
     useEffect(() => {
@@ -32,6 +34,21 @@ export default function SubmissionForm({ show, onHide, onCreated }) {
             .then((r) => (r.ok ? r.json() : []))
             .then((rows) => setCompanies(rows.map((c) => ({ id: c.id, name: c.name }))))
             .catch(() => setCompanies([]));
+        apiFetch('/resumes')
+            .then((r) => (r.ok ? r.json() : []))
+            .then((rows) => {
+            const opts = rows.map((r) => ({
+                id: r.id,
+                title: r.title,
+                is_master: r.is_master,
+            }));
+            setResumes(opts);
+            // Default to the master resume if one exists.
+            const master = opts.find((r) => r.is_master);
+            if (master)
+                setResumeId(String(master.id));
+        })
+            .catch(() => setResumes([]));
     }, [show, apiFetch]);
     function reset() {
         setCompanyName('');
@@ -41,6 +58,7 @@ export default function SubmissionForm({ show, onHide, onCreated }) {
         setJdUrl('');
         setJdText('');
         setNotes('');
+        setResumeId('');
         setError(null);
     }
     async function handleSubmit(e) {
@@ -58,6 +76,7 @@ export default function SubmissionForm({ show, onHide, onCreated }) {
                     jd_url: jdUrl.trim() || undefined,
                     jd_text: jdText || undefined,
                     notes: notes || undefined,
+                    resume_id: resumeId ? Number(resumeId) : undefined,
                 }),
             });
             if (!r.ok)
@@ -73,5 +92,5 @@ export default function SubmissionForm({ show, onHide, onCreated }) {
             setSaving(false);
         }
     }
-    return (_jsx(Modal, { show: show, onHide: onHide, size: "lg", children: _jsxs(Form, { onSubmit: handleSubmit, children: [_jsx(Modal.Header, { closeButton: true, children: _jsx(Modal.Title, { children: "New submission" }) }), _jsxs(Modal.Body, { children: [error && _jsx(Alert, { variant: "danger", children: error }), _jsxs(Row, { className: "g-3", children: [_jsx(Col, { md: 6, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Company" }), _jsx(Form.Control, { list: "companies-list", value: companyName, onChange: (e) => setCompanyName(e.target.value), placeholder: "Existing or new company" }), _jsx("datalist", { id: "companies-list", children: companies.map((c) => (_jsx("option", { value: c.name }, c.id))) })] }) }), _jsx(Col, { md: 6, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Role title" }), _jsx(Form.Control, { value: roleTitle, onChange: (e) => setRoleTitle(e.target.value) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Status" }), _jsx(Form.Select, { value: status, onChange: (e) => setStatus(e.target.value), children: STATUSES.map((s) => (_jsx("option", { value: s.short_name, children: s.label }, s.short_name))) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Submitted on" }), _jsx(Form.Control, { type: "date", value: submittedOn, onChange: (e) => setSubmittedOn(e.target.value) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "JD URL" }), _jsx(Form.Control, { type: "url", value: jdUrl, onChange: (e) => setJdUrl(e.target.value), placeholder: "https://..." })] }) }), _jsx(Col, { md: 12, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "JD text" }), _jsx(Form.Control, { as: "textarea", rows: 6, value: jdText, onChange: (e) => setJdText(e.target.value), placeholder: "Paste the job description body here" }), _jsx(Form.Text, { className: "text-muted", children: "Archived to S3 on save. Used for AI tailoring later." })] }) }), _jsx(Col, { md: 12, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Notes" }), _jsx(Form.Control, { as: "textarea", rows: 3, value: notes, onChange: (e) => setNotes(e.target.value) })] }) })] })] }), _jsxs(Modal.Footer, { children: [_jsx(Button, { variant: "secondary", onClick: onHide, disabled: saving, children: "Cancel" }), _jsx(Button, { type: "submit", disabled: saving, children: saving ? 'Saving…' : 'Create submission' })] })] }) }));
+    return (_jsx(Modal, { show: show, onHide: onHide, size: "lg", children: _jsxs(Form, { onSubmit: handleSubmit, children: [_jsx(Modal.Header, { closeButton: true, children: _jsx(Modal.Title, { children: "New submission" }) }), _jsxs(Modal.Body, { children: [error && _jsx(Alert, { variant: "danger", children: error }), _jsxs(Row, { className: "g-3", children: [_jsx(Col, { md: 6, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Company" }), _jsx(Form.Control, { list: "companies-list", value: companyName, onChange: (e) => setCompanyName(e.target.value), placeholder: "Existing or new company" }), _jsx("datalist", { id: "companies-list", children: companies.map((c) => (_jsx("option", { value: c.name }, c.id))) })] }) }), _jsx(Col, { md: 6, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Role title" }), _jsx(Form.Control, { value: roleTitle, onChange: (e) => setRoleTitle(e.target.value) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Status" }), _jsx(Form.Select, { value: status, onChange: (e) => setStatus(e.target.value), children: STATUSES.map((s) => (_jsx("option", { value: s.short_name, children: s.label }, s.short_name))) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Submitted on" }), _jsx(Form.Control, { type: "date", value: submittedOn, onChange: (e) => setSubmittedOn(e.target.value) })] }) }), _jsx(Col, { md: 4, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "JD URL" }), _jsx(Form.Control, { type: "url", value: jdUrl, onChange: (e) => setJdUrl(e.target.value), placeholder: "https://..." })] }) }), _jsx(Col, { md: 12, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Resume" }), _jsxs(Form.Select, { value: resumeId, onChange: (e) => setResumeId(e.target.value), children: [_jsx("option", { value: "", children: "\u2014 none \u2014" }), resumes.map((r) => (_jsxs("option", { value: r.id, children: [r.title || `Resume #${r.id}`, r.is_master ? ' (master)' : ''] }, r.id)))] }), _jsxs(Form.Text, { className: "text-muted", children: ["Defaults to your master resume. Manage at", ' ', _jsx("strong", { children: "Resumes" }), " in the sidebar."] })] }) }), _jsx(Col, { md: 12, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "JD text" }), _jsx(Form.Control, { as: "textarea", rows: 6, value: jdText, onChange: (e) => setJdText(e.target.value), placeholder: "Paste the job description body here" }), _jsx(Form.Text, { className: "text-muted", children: "Archived to S3 on save. Used for AI tailoring later." })] }) }), _jsx(Col, { md: 12, children: _jsxs(Form.Group, { children: [_jsx(Form.Label, { children: "Notes" }), _jsx(Form.Control, { as: "textarea", rows: 3, value: notes, onChange: (e) => setNotes(e.target.value) })] }) })] })] }), _jsxs(Modal.Footer, { children: [_jsx(Button, { variant: "secondary", onClick: onHide, disabled: saving, children: "Cancel" }), _jsx(Button, { type: "submit", disabled: saving, children: saving ? 'Saving…' : 'Create submission' })] })] }) }));
 }

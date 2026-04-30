@@ -283,13 +283,14 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
             SELECT
                 s.id, s.role_title, s.submitted_on, s.notes,
                 s.company_id, c.name AS company_name,
-                s.resume_id,
+                s.resume_id, r.title AS resume_title,
                 ss.short_name AS status,
                 s.tailored_title, s.tailored_summary, s.jd_url,
                 s.created_at, s.updated_at
             FROM submissions s
             JOIN submission_statuses ss ON ss.id = s.submission_status_id
             LEFT JOIN companies c ON c.id = s.company_id AND c.deleted_at IS NULL
+            LEFT JOIN resumes r ON r.id = s.resume_id AND r.deleted_at IS NULL
             WHERE s.id = %s AND s.user_id = %s AND s.deleted_at IS NULL
             """,
             (submission_id, user_id),
@@ -349,6 +350,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
 
     detail = _row_to_summary(row)
     detail["resume_id"] = int(row["resume_id"]) if row["resume_id"] is not None else None
+    detail["resume_title"] = row.get("resume_title")
     detail["jd_snapshot"] = (
         {
             "id": int(jd_row["id"]),
@@ -395,7 +397,11 @@ _MUTABLE_FIELDS = {
 
 
 def _update(
-    conn: Any, user_id: int, submission_id: int, body: dict[str, Any]
+    conn: Any,
+    user_id: int,
+    cognito_sub: str,
+    submission_id: int,
+    body: dict[str, Any],
 ) -> dict[str, Any]:
     sets: list[str] = []
     params: list[Any] = []
@@ -409,27 +415,89 @@ def _update(
             sets.append(fragment)
             params.append(body[field])
 
-    if not sets:
+    if sets:
+        params.extend([submission_id, user_id])
+        logger.info(
+            "submissions.update: updating",
+            extra={
+                "user_id": user_id,
+                "submission_id": submission_id,
+                "fields": list(body.keys()),
+            },
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE submissions SET {', '.join(sets)} WHERE id = %s AND user_id = %s",
+                tuple(params),
+            )
+            if cur.rowcount == 0:
+                raise LookupError("submission not found")
+
+    if "jd_text" in body:
+        _update_jd(
+            conn,
+            user_id=user_id,
+            cognito_sub=cognito_sub,
+            submission_id=submission_id,
+            body=body,
+        )
+
+    if not sets and "jd_text" not in body:
         return _detail(conn, user_id, submission_id)
 
-    params.extend([submission_id, user_id])
+    conn.commit()
+    return _detail(conn, user_id, submission_id)
+
+
+def _update_jd(
+    conn: Any,
+    *,
+    user_id: int,
+    cognito_sub: str,
+    submission_id: int,
+    body: dict[str, Any],
+) -> None:
+    """Apply a JD-text edit from a PUT body.
+
+    Empty/None ``jd_text`` soft-deletes the snapshot. Non-empty upserts via
+    ``_store_jd``. ``jd_url`` for ``source_url`` comes from the body if
+    present, else is read from the submission row so an unrelated edit
+    doesn't clobber the existing source URL.
+    """
+    jd_text = body.get("jd_text") or ""
+
+    if "jd_url" in body:
+        source_url = body.get("jd_url") or None
+    else:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT jd_url FROM submissions "
+                "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+                (submission_id, user_id),
+            )
+            row = cur.fetchone()
+        source_url = (row.get("jd_url") if row else None)
+
+    if jd_text:
+        _store_jd(
+            conn,
+            cognito_sub=cognito_sub,
+            submission_id=submission_id,
+            jd_text=jd_text,
+            jd_url=source_url,
+        )
+        return
+
     logger.info(
-        "submissions.update: updating",
-        extra={
-            "user_id": user_id,
-            "submission_id": submission_id,
-            "fields": list(body.keys()),
-        },
+        "submissions.jd: clearing snapshot",
+        extra={"user_id": user_id, "submission_id": submission_id},
     )
     with conn.cursor() as cur:
         cur.execute(
-            f"UPDATE submissions SET {', '.join(sets)} WHERE id = %s AND user_id = %s",
-            tuple(params),
+            "UPDATE jd_snapshots SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE submission_id = %s AND deleted_at IS NULL",
+            (submission_id,),
         )
-        if cur.rowcount == 0:
-            raise LookupError("submission not found")
-    conn.commit()
-    return _detail(conn, user_id, submission_id)
 
 
 @logger.inject_lambda_context(log_event=False)
@@ -450,7 +518,7 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
                 result = _detail(conn, user_id, _path_id(event))
             elif route_key == "PUT /submissions/{id}":
                 body = json.loads(event.get("body") or "{}")
-                result = _update(conn, user_id, _path_id(event), body)
+                result = _update(conn, user_id, sub, _path_id(event), body)
             else:
                 logger.warning("submissions: unknown route", extra={"route_key": route_key})
                 return _response(404, {"error": f"no handler for {route_key}"})

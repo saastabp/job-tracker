@@ -327,6 +327,86 @@ Resources:
             Path: /submissions/{id}
             Method: PUT
 
+  ResumesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-resumes
+      CodeUri: ../../backend/src
+      Handler: handlers.resumes.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          RESUME_BUCKET: !Ref ResumeBucketName
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub '${ResumeBucketArn}/users/*'
+      Events:
+        ListResumes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes
+            Method: GET
+        CreateResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes
+            Method: POST
+        GetResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}
+            Method: GET
+        UpdateResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}
+            Method: PUT
+        DeleteResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}
+            Method: DELETE
+        ResumeUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}/upload-url
+            Method: POST
+        RestoreResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}/restore
+            Method: POST
+        PurgeResume:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}/purge
+            Method: POST
+
   PostConfirmationCognitoPermission:
     Type: AWS::Lambda::Permission
     Properties:

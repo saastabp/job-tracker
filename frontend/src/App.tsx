@@ -8,6 +8,8 @@ import Submissions from './pages/Submissions';
 import SubmissionDetail from './pages/SubmissionDetail';
 import Companies from './pages/Companies';
 import CompanyDetail from './pages/CompanyDetail';
+import Resumes from './pages/Resumes';
+import ResumeDetail from './pages/ResumeDetail';
 import Health from './pages/Health';
 import Login from './pages/Login';
 import ComingSoon from './pages/ComingSoon';
@@ -38,10 +40,8 @@ export default function App() {
           <Route path="submissions/:id" element={<SubmissionDetail />} />
           <Route path="companies" element={<Companies />} />
           <Route path="companies/:id" element={<CompanyDetail />} />
-          <Route
-            path="resumes"
-            element={<ComingSoon title="Resumes" slice="slice 04" />}
-          />
+          <Route path="resumes" element={<Resumes />} />
+          <Route path="resumes/:id" element={<ResumeDetail />} />
           <Route
             path="contacts"
             element={<ComingSoon title="Contacts" slice="slice 05" />}

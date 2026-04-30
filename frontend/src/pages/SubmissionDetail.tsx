@@ -49,22 +49,35 @@ interface SubmissionDetail {
   tailored_summary: string | null;
   jd_url: string | null;
   resume_id: number | null;
+  resume_title: string | null;
   jd_snapshot: JdSnapshot | null;
   jd_text: string | null;
   follow_ups: FollowUp[];
   responses: ResponseRow[];
 }
 
+interface ResumeOption {
+  id: number;
+  title: string | null;
+  is_master: boolean;
+}
+
 export default function SubmissionDetail() {
   const apiFetch = useApi();
   const { id } = useParams<{ id: string }>();
   const [data, setData] = useState<SubmissionDetail | null>(null);
+  const [resumes, setResumes] = useState<ResumeOption[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showJd, setShowJd] = useState(false);
   const [savingField, setSavingField] = useState<string | null>(null);
   const [editNotes, setEditNotes] = useState('');
   const [editTailoredTitle, setEditTailoredTitle] = useState('');
   const [editTailoredSummary, setEditTailoredSummary] = useState('');
+  const [editSubmittedOn, setEditSubmittedOn] = useState('');
+  const [editJdUrl, setEditJdUrl] = useState('');
+  const [editJdText, setEditJdText] = useState('');
+  const [editingRoleTitle, setEditingRoleTitle] = useState(false);
+  const [roleTitleDraft, setRoleTitleDraft] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -75,6 +88,9 @@ export default function SubmissionDetail() {
       setEditNotes(d.notes ?? '');
       setEditTailoredTitle(d.tailored_title ?? '');
       setEditTailoredSummary(d.tailored_summary ?? '');
+      setEditSubmittedOn(d.submitted_on ?? '');
+      setEditJdUrl(d.jd_url ?? '');
+      setEditJdText(d.jd_text ?? '');
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -84,6 +100,35 @@ export default function SubmissionDetail() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    apiFetch('/resumes')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) =>
+        setResumes(
+          rows.map((r: any) => ({
+            id: r.id,
+            title: r.title,
+            is_master: r.is_master,
+          })),
+        ),
+      )
+      .catch(() => setResumes([]));
+  }, [apiFetch]);
+
+  function startEditingRoleTitle() {
+    setRoleTitleDraft(data?.role_title ?? '');
+    setEditingRoleTitle(true);
+  }
+
+  async function commitRoleTitle() {
+    if (!data) return;
+    const next = roleTitleDraft.trim();
+    const current = data.role_title ?? '';
+    setEditingRoleTitle(false);
+    if (next === current) return;
+    await patchField('role_title', next || null, 'role_title');
+  }
 
   async function patchField(field: string, value: unknown, label: string) {
     setSavingField(label);
@@ -110,6 +155,11 @@ export default function SubmissionDetail() {
       body.tailored_title = editTailoredTitle || null;
     if (editTailoredSummary !== (data.tailored_summary ?? ''))
       body.tailored_summary = editTailoredSummary || null;
+    if (editSubmittedOn !== (data.submitted_on ?? ''))
+      body.submitted_on = editSubmittedOn || null;
+    if (editJdUrl.trim() !== (data.jd_url ?? ''))
+      body.jd_url = editJdUrl.trim() || null;
+    if (editJdText !== (data.jd_text ?? '')) body.jd_text = editJdText;
     if (Object.keys(body).length === 0) return;
 
     setSavingField('save');
@@ -124,6 +174,9 @@ export default function SubmissionDetail() {
       setEditNotes(d.notes ?? '');
       setEditTailoredTitle(d.tailored_title ?? '');
       setEditTailoredSummary(d.tailored_summary ?? '');
+      setEditSubmittedOn(d.submitted_on ?? '');
+      setEditJdUrl(d.jd_url ?? '');
+      setEditJdText(d.jd_text ?? '');
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -141,9 +194,37 @@ export default function SubmissionDetail() {
         <Link to="/submissions" className="me-3">
           ← Back
         </Link>
-        <h3 className="mb-0">
-          {data.role_title || <span className="text-muted">Untitled role</span>}
-        </h3>
+        {editingRoleTitle ? (
+          <Form.Control
+            autoFocus
+            size="lg"
+            value={roleTitleDraft}
+            onChange={(e) => setRoleTitleDraft(e.target.value)}
+            onBlur={commitRoleTitle}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                commitRoleTitle();
+              } else if (e.key === 'Escape') {
+                setEditingRoleTitle(false);
+              }
+            }}
+            disabled={savingField === 'role_title'}
+            placeholder="Role title"
+            style={{ maxWidth: 480 }}
+          />
+        ) : (
+          <h3
+            className="mb-0"
+            onClick={startEditingRoleTitle}
+            title="Click to edit"
+            style={{ cursor: 'pointer' }}
+          >
+            {data.role_title || (
+              <span className="text-muted">Untitled role</span>
+            )}
+          </h3>
+        )}
         <span className="ms-3">
           <StatusBadge status={data.status} />
         </span>
@@ -164,17 +245,34 @@ export default function SubmissionDetail() {
                 <span className="text-muted">—</span>
               )}
               <hr />
-              <Card.Subtitle className="text-muted mb-2">Submitted</Card.Subtitle>
-              <div>{data.submitted_on ?? '—'}</div>
-              {data.jd_url && (
-                <>
-                  <hr />
-                  <Card.Subtitle className="text-muted mb-2">JD URL</Card.Subtitle>
-                  <a href={data.jd_url} target="_blank" rel="noreferrer">
-                    {data.jd_url}
-                  </a>
-                </>
-              )}
+              <Form.Group className="mb-3">
+                <Form.Label className="text-muted small mb-1">
+                  Submitted on
+                </Form.Label>
+                <Form.Control
+                  type="date"
+                  value={editSubmittedOn}
+                  onChange={(e) => setEditSubmittedOn(e.target.value)}
+                />
+              </Form.Group>
+              <Form.Group>
+                <Form.Label className="text-muted small mb-1">
+                  Link to Job Description
+                </Form.Label>
+                <Form.Control
+                  type="url"
+                  value={editJdUrl}
+                  onChange={(e) => setEditJdUrl(e.target.value)}
+                  placeholder="https://..."
+                />
+                {data.jd_url && (
+                  <Form.Text>
+                    <a href={data.jd_url} target="_blank" rel="noreferrer">
+                      Open current link
+                    </a>
+                  </Form.Text>
+                )}
+              </Form.Group>
             </Card.Body>
           </Card>
         </Col>
@@ -193,6 +291,35 @@ export default function SubmissionDetail() {
                   </option>
                 ))}
               </Form.Select>
+
+              <hr />
+              <Card.Subtitle className="text-muted mb-2">Resume</Card.Subtitle>
+              <Form.Select
+                value={data.resume_id ?? ''}
+                disabled={savingField === 'resume_id'}
+                onChange={(e) =>
+                  patchField(
+                    'resume_id',
+                    e.target.value ? Number(e.target.value) : null,
+                    'resume_id',
+                  )
+                }
+              >
+                <option value="">— none —</option>
+                {resumes.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.title || `Resume #${r.id}`}
+                    {r.is_master ? ' (master)' : ''}
+                  </option>
+                ))}
+              </Form.Select>
+              {data.resume_id && (
+                <div className="mt-1 small">
+                  <Link to={`/resumes/${data.resume_id}`}>
+                    Open {data.resume_title || `resume #${data.resume_id}`}
+                  </Link>
+                </div>
+              )}
 
               <hr />
               <Card.Subtitle className="text-muted mb-2">Actions</Card.Subtitle>
@@ -223,30 +350,32 @@ export default function SubmissionDetail() {
 
       <Card className="mb-3">
         <Card.Body>
-          <div className="d-flex justify-content-between align-items-center">
-            <Card.Subtitle className="text-muted">JD text</Card.Subtitle>
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <Card.Subtitle className="text-muted">Job Description</Card.Subtitle>
             {data.jd_snapshot && (
               <Button
                 variant="link"
                 size="sm"
                 onClick={() => setShowJd((v) => !v)}
               >
-                {showJd ? 'Hide' : 'Show'}
+                {showJd ? 'Collapse' : 'Expand'}
               </Button>
             )}
           </div>
-          {!data.jd_snapshot && (
-            <div className="text-muted mt-2">
-              No JD captured for this submission.
+          <Collapse in={showJd || !data.jd_snapshot}>
+            <div>
+              <Form.Control
+                as="textarea"
+                rows={data.jd_snapshot ? 16 : 6}
+                value={editJdText}
+                onChange={(e) => setEditJdText(e.target.value)}
+                placeholder="Paste the job description body here. Archived to S3 on save."
+                style={{ fontFamily: 'monospace' }}
+              />
+              <Form.Text className="text-muted">
+                Used as input to AI tailoring later. Leaving this empty clears the saved snapshot.
+              </Form.Text>
             </div>
-          )}
-          <Collapse in={showJd}>
-            <pre
-              className="mt-3 mb-0 p-3 bg-light border rounded"
-              style={{ whiteSpace: 'pre-wrap', maxHeight: 400, overflow: 'auto' }}
-            >
-              {data.jd_text ?? '(unavailable)'}
-            </pre>
           </Collapse>
         </Card.Body>
       </Card>
@@ -282,7 +411,10 @@ export default function SubmissionDetail() {
             savingField === 'save' ||
             (editNotes === (data.notes ?? '') &&
               editTailoredTitle === (data.tailored_title ?? '') &&
-              editTailoredSummary === (data.tailored_summary ?? ''))
+              editTailoredSummary === (data.tailored_summary ?? '') &&
+              editSubmittedOn === (data.submitted_on ?? '') &&
+              editJdUrl.trim() === (data.jd_url ?? '') &&
+              editJdText === (data.jd_text ?? ''))
           }
         >
           {savingField === 'save' ? 'Saving…' : 'Save changes'}
