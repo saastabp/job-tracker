@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -35,10 +36,17 @@ import boto3
 from common.auth import user_sub
 from common.db import get_connection
 from common.logger import logger
+from common.scheduler import schedule_followup
 from common.users import get_user_id
 
 RESUME_BUCKET = os.environ.get("RESUME_BUCKET", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+
+# Auto-created follow-ups fire mid-morning UTC. The user's local timezone
+# isn't tracked yet (deferred — see dashboard.py time-semantics note); 09:00
+# UTC is 02:00 PT / 05:00 ET, so we shift to a reasonable global compromise
+# until per-user TZ ships.
+_AUTO_FOLLOWUP_HOUR_UTC = 14  # 07:00 PT, 10:00 ET, 15:00 UK
 
 _s3 = boto3.client("s3", region_name=AWS_REGION)
 
@@ -268,8 +276,95 @@ def _create(
             jd_url=jd_url,
         )
 
+    _auto_queue_followup(
+        conn, user_id=user_id, submission_id=new_id, submitted_on=submitted_on
+    )
+
     conn.commit()
     return _detail(conn, user_id, new_id)
+
+
+def _auto_queue_followup(
+    conn: Any,
+    *,
+    user_id: int,
+    submission_id: int,
+    submitted_on: Any,
+) -> None:
+    """Insert + schedule the on-create auto follow-up.
+
+    Reads ``users.follow_up_days``, computes ``due_at = submitted_on +
+    follow_up_days`` at the auto-followup hour UTC, inserts a follow_ups row
+    flagged ``auto_created = TRUE``, and registers an EventBridge schedule.
+
+    Soft-fails on every step except the row INSERT — the schedule is a
+    side-effect and the dashboard pending count works without it. If we
+    can't determine ``submitted_on`` (None), we skip auto-create entirely
+    rather than guess; the user can add one by hand.
+    """
+    if submitted_on is None:
+        logger.info(
+            "submissions.auto_followup: skipping (no submitted_on)",
+            extra={"user_id": user_id, "submission_id": submission_id},
+        )
+        return
+
+    base_date = _coerce_date(submitted_on)
+    if base_date is None:
+        logger.warning(
+            "submissions.auto_followup: unparseable submitted_on, skipping",
+            extra={"user_id": user_id, "submission_id": submission_id, "submitted_on": str(submitted_on)},
+        )
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT follow_up_days FROM users WHERE id = %s AND deleted_at IS NULL",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    days = int(row.get("follow_up_days") or 7) if row else 7
+
+    due_at = datetime.combine(
+        base_date + timedelta(days=days),
+        time(hour=_AUTO_FOLLOWUP_HOUR_UTC),
+        tzinfo=timezone.utc,
+    )
+
+    logger.info(
+        "submissions.auto_followup: inserting",
+        extra={
+            "user_id": user_id,
+            "submission_id": submission_id,
+            "due_at": due_at.isoformat(),
+            "follow_up_days": days,
+        },
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO follow_ups
+                (submission_id, due_at, auto_created)
+            VALUES (%s, %s, TRUE)
+            """,
+            (submission_id, due_at.replace(tzinfo=None)),
+        )
+        follow_up_id = int(cur.lastrowid)
+
+    schedule_followup(follow_up_id=follow_up_id, due_at=due_at)
+
+
+def _coerce_date(value: Any) -> date | None:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
@@ -308,7 +403,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
 
         cur.execute(
             """
-            SELECT id, due_at, actioned_at, notes
+            SELECT id, due_at, actioned_at, notified_at, notes, auto_created
             FROM follow_ups
             WHERE submission_id = %s AND deleted_at IS NULL
             ORDER BY due_at
@@ -320,7 +415,9 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
                 "id": int(r["id"]),
                 "due_at": str(r["due_at"]) if r["due_at"] else None,
                 "actioned_at": str(r["actioned_at"]) if r["actioned_at"] else None,
+                "notified_at": str(r["notified_at"]) if r.get("notified_at") else None,
                 "notes": r["notes"],
+                "auto_created": bool(r.get("auto_created")),
             }
             for r in cur.fetchall()
         ]

@@ -1,6 +1,6 @@
 .PHONY: help check-prereqs fetch-rds-ca \
-        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-all \
-        wire-frontend migrate delete-ai \
+        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-all \
+        wire-frontend migrate delete-ai delete-scheduler \
         deploy-bastion destroy-bastion tunnel db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
@@ -25,6 +25,8 @@ help:
 	@echo "  deploy-frontend   Deploy S3 SPA bucket + CloudFront"
 	@echo "  deploy-ai         Deploy AI stack (Bedrock-backed Lambdas, no VPC)"
 	@echo "  delete-ai         Tear down the AI stack"
+	@echo "  deploy-scheduler  Deploy scheduler stack (EventBridge Scheduler + follow-up notify Lambda + SES verified identity)"
+	@echo "  delete-scheduler  Tear down the scheduler stack (follow_ups rows persist; reminders stop firing)"
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
 	@echo "  wire-frontend     Re-deploy auth + api + ai with the CloudFront URL added to callbacks/CORS"
 	@echo "  migrate           Invoke the MigrationRunner Lambda (applies pending backend/migrations/*.sql)"
@@ -73,8 +75,14 @@ deploy-auth:
 
 deploy-api: deploy-network deploy-data deploy-auth fetch-rds-ca
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
-	if [ -n "$$CF_URL" ]; then \
-		cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides "CorsOrigins=http://localhost:5173,$$CF_URL"; \
+	SCHED_GROUP=$$(aws ssm get-parameter --name /jobtracker/scheduler/group-name --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	SCHED_TARGET=$$(aws ssm get-parameter --name /jobtracker/scheduler/notify-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	SCHED_ROLE=$$(aws ssm get-parameter --name /jobtracker/scheduler/exec-role-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	ARGS=""; \
+	if [ -n "$$CF_URL" ]; then ARGS="$$ARGS CorsOrigins=http://localhost:5173,$$CF_URL"; fi; \
+	if [ -n "$$SCHED_GROUP" ]; then ARGS="$$ARGS SchedulerGroupName=$$SCHED_GROUP SchedulerNotifyArn=$$SCHED_TARGET SchedulerRoleArn=$$SCHED_ROLE"; fi; \
+	if [ -n "$$ARGS" ]; then \
+		cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides $$ARGS; \
 	else \
 		cd $(ROOT)/infra/api && sam build && sam deploy; \
 	fi
@@ -97,10 +105,24 @@ delete-ai:
 	cd $(ROOT)/infra/ai && sam delete --no-prompts
 	@aws ssm delete-parameter --name /jobtracker/ai/url --region $(REGION) 2>/dev/null || true
 
-deploy-all: deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai wire-frontend
+# Scheduler stack runs INSIDE the VPC (the notify Lambda reads users/follow_ups
+# from RDS) and only depends on data + network. The api stack reads its
+# /jobtracker/scheduler/* SSM params during deploy-api (graceful no-op if
+# this stack isn't deployed). Per stack-segregation rule.
+deploy-scheduler: deploy-data
+	cd $(ROOT)/infra/scheduler && sam build && sam deploy
+
+delete-scheduler:
+	cd $(ROOT)/infra/scheduler && sam delete --no-prompts
+	@aws ssm delete-parameter --name /jobtracker/scheduler/group-name --region $(REGION) 2>/dev/null || true
+	@aws ssm delete-parameter --name /jobtracker/scheduler/notify-arn --region $(REGION) 2>/dev/null || true
+	@aws ssm delete-parameter --name /jobtracker/scheduler/exec-role-arn --region $(REGION) 2>/dev/null || true
+
+deploy-all: deploy-network deploy-data deploy-auth deploy-scheduler deploy-api deploy-frontend deploy-ai wire-frontend
 	@echo
 	@echo "All stacks deployed and CloudFront URL wired into auth + api + ai."
-	@echo "Next: one-time bootstrap of the MySQL 'app' user (see README)."
+	@echo "Next: one-time bootstrap of the MySQL 'app' user (see README), and"
+	@echo "  click the SES verification email sent to the SenderEmail address."
 
 wire-frontend:
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url \

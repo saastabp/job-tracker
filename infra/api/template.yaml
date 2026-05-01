@@ -44,6 +44,24 @@ Parameters:
     Type: String
     Default: app
     Description: MySQL user that the Lambda authenticates as via RDS IAM. Must be created in MySQL after the data stack deploys (see README bootstrap step).
+  SchedulerGroupName:
+    Type: String
+    Default: ''
+    Description: EventBridge Scheduler group for follow-up reminders (from the scheduler stack). Empty = scheduler stack not deployed; api Lambdas will skip schedule writes silently.
+  SchedulerNotifyArn:
+    Type: String
+    # Placeholder ARN-shaped default so cfn-lint's Resource-field regex passes
+    # when the scheduler stack isn't deployed; HasScheduler keys off the
+    # group name (empty default) for conditional inclusion of the policy.
+    Default: 'arn:aws:lambda:us-west-2:000000000000:function:none'
+    Description: ARN of the notify Lambda the scheduler invokes (from the scheduler stack). Inert default when SchedulerGroupName is empty.
+  SchedulerRoleArn:
+    Type: String
+    Default: 'arn:aws:iam::000000000000:role/none'
+    Description: ARN of the role EventBridge Scheduler assumes to invoke the notify Lambda (from the scheduler stack). Inert default when SchedulerGroupName is empty.
+
+Conditions:
+  HasScheduler: !Not [!Equals [!Ref SchedulerGroupName, '']]
 
 Globals:
   Function:
@@ -288,6 +306,9 @@ Resources:
           DB_NAME: !Ref DbName
           DB_USER: !Ref DbUser
           RESUME_BUCKET: !Ref ResumeBucketName
+          SCHEDULER_GROUP_NAME: !Ref SchedulerGroupName
+          SCHEDULER_NOTIFY_ARN: !Ref SchedulerNotifyArn
+          SCHEDULER_ROLE_ARN: !Ref SchedulerRoleArn
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
@@ -301,6 +322,23 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub '${ResumeBucketArn}/users/*'
+        - !If
+          - HasScheduler
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${SchedulerGroupName}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref SchedulerRoleArn
+                Condition:
+                  StringLike:
+                    iam:PassedToService: scheduler.amazonaws.com
+          - !Ref AWS::NoValue
       Events:
         ListSubmissions:
           Type: HttpApi
@@ -326,6 +364,75 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /submissions/{id}
             Method: PUT
+
+  FollowUpsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-followups
+      CodeUri: ../../backend/src
+      Handler: handlers.followups.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSgId]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          SCHEDULER_GROUP_NAME: !Ref SchedulerGroupName
+          SCHEDULER_NOTIFY_ARN: !Ref SchedulerNotifyArn
+          SCHEDULER_ROLE_ARN: !Ref SchedulerRoleArn
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+        - !If
+          - HasScheduler
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${SchedulerGroupName}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref SchedulerRoleArn
+                Condition:
+                  StringLike:
+                    iam:PassedToService: scheduler.amazonaws.com
+          - !Ref AWS::NoValue
+      Events:
+        ListFollowUps:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /follow-ups
+            Method: GET
+        CreateFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}/follow-ups
+            Method: POST
+        UpdateFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /follow-ups/{id}
+            Method: PUT
+        DeleteFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /follow-ups/{id}
+            Method: DELETE
 
   ContactsFunction:
     Type: AWS::Serverless::Function

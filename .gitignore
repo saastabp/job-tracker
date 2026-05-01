@@ -86,6 +86,14 @@ celerybeat-schedule
 node_modules/
 dist/
 
+# Frontend tsc output that should never be committed: Vite is the only thing
+# that emits JS for this project, and tsconfig.json has noEmit:true to enforce
+# it. These globs exist as a belt-and-braces guard against an accidental
+# `tsc` run with emit enabled, or a stray `tsc -b`.
+frontend/src/**/*.js
+frontend/src/**/*.js.map
+frontend/src/**/*.d.ts
+
 # SAM build artifacts
 .aws-sam/
 

@@ -9,6 +9,7 @@ const NAV_ITEMS: { to: string; label: string }[] = [
   { to: '/companies', label: 'Companies' },
   { to: '/resumes', label: 'Resumes' },
   { to: '/contacts', label: 'Contacts' },
+  { to: '/follow-ups', label: 'Follow-ups' },
   { to: '/targets', label: 'Targets' },
 ];
 

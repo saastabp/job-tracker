@@ -157,7 +157,7 @@ export default function Dashboard() {
                 {m.follow_ups.pending ?? 0}
               </div>
               <Card.Text className="text-muted mb-0">
-                Submissions awaiting a follow-up.
+                <Link to="/follow-ups">Open follow-ups</Link>
               </Card.Text>
             </Card.Body>
           </Card>

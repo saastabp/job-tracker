@@ -26,7 +26,9 @@ interface FollowUp {
   id: number;
   due_at: string | null;
   actioned_at: string | null;
+  notified_at: string | null;
   notes: string | null;
+  auto_created: boolean;
 }
 
 interface ResponseRow {
@@ -63,6 +65,27 @@ interface ResumeOption {
   is_master: boolean;
 }
 
+function defaultDueDate(): string {
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  return d.toISOString().slice(0, 10);
+}
+
+function normalizeDue(raw: string): string | null {
+  // Accept YYYY-MM-DD (default to 14:00 UTC) or YYYY-MM-DDTHH:MM (assume UTC).
+  const trimmed = raw.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `${trimmed}T14:00:00Z`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(trimmed)) {
+    return `${trimmed}:00Z`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(trimmed)) {
+    return trimmed.endsWith('Z') ? trimmed : `${trimmed}Z`;
+  }
+  return null;
+}
+
 export default function SubmissionDetail() {
   const apiFetch = useApi();
   const { id } = useParams<{ id: string }>();
@@ -81,6 +104,8 @@ export default function SubmissionDetail() {
   const [roleTitleDraft, setRoleTitleDraft] = useState('');
   const [tailorBusy, setTailorBusy] = useState(false);
   const [tailorMessage, setTailorMessage] = useState<string | null>(null);
+  const [followUpBusyId, setFollowUpBusyId] = useState<number | null>(null);
+  const [addFollowUpBusy, setAddFollowUpBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -172,6 +197,76 @@ export default function SubmissionDetail() {
     setEditingRoleTitle(false);
     if (next === current) return;
     await patchField('role_title', next || null, 'role_title');
+  }
+
+  async function addFollowUp() {
+    const ans = prompt(
+      'Due date for the new follow-up (YYYY-MM-DD or YYYY-MM-DDTHH:MM):',
+      defaultDueDate(),
+    );
+    if (!ans) return;
+    const isoDue = normalizeDue(ans);
+    if (!isoDue) {
+      setError(`Invalid date: ${ans}`);
+      return;
+    }
+    setAddFollowUpBusy(true);
+    try {
+      const r = await apiFetch(`/submissions/${id}/follow-ups`, {
+        method: 'POST',
+        body: JSON.stringify({ due_at: isoDue }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAddFollowUpBusy(false);
+    }
+  }
+
+  async function actionFollowUp(fuId: number, body: object) {
+    setFollowUpBusyId(fuId);
+    try {
+      const r = await apiFetch(`/follow-ups/${fuId}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFollowUpBusyId(null);
+    }
+  }
+
+  async function deleteFollowUp(fuId: number) {
+    if (!confirm('Delete this follow-up?')) return;
+    setFollowUpBusyId(fuId);
+    try {
+      const r = await apiFetch(`/follow-ups/${fuId}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFollowUpBusyId(null);
+    }
+  }
+
+  async function rescheduleFollowUp(fuId: number, currentDueAt: string | null) {
+    const ans = prompt(
+      'New due date (YYYY-MM-DD or YYYY-MM-DDTHH:MM):',
+      currentDueAt?.slice(0, 16) ?? defaultDueDate(),
+    );
+    if (!ans) return;
+    const iso = normalizeDue(ans);
+    if (!iso) {
+      setError(`Invalid date: ${ans}`);
+      return;
+    }
+    await actionFollowUp(fuId, { due_at: iso });
   }
 
   async function patchField(field: string, value: unknown, label: string) {
@@ -376,8 +471,13 @@ export default function SubmissionDetail() {
                 >
                   {tailorBusy ? 'Tailoring…' : 'Tailor with AI'}
                 </Button>
-                <Button variant="outline-secondary" size="sm" disabled>
-                  Trigger follow-up <Badge bg="light" text="dark">slice 08</Badge>
+                <Button
+                  variant="outline-secondary"
+                  size="sm"
+                  onClick={addFollowUp}
+                  disabled={addFollowUpBusy}
+                >
+                  {addFollowUpBusy ? 'Adding…' : 'Add follow-up'}
                 </Button>
               </div>
               {tailorMessage && (
@@ -473,21 +573,85 @@ export default function SubmissionDetail() {
         </Button>
       </div>
 
-      {data.follow_ups.length > 0 && (
-        <Card className="mb-3">
-          <Card.Body>
-            <Card.Subtitle className="text-muted mb-2">Follow-ups</Card.Subtitle>
-            <ul className="mb-0">
-              {data.follow_ups.map((f) => (
-                <li key={f.id}>
-                  Due {f.due_at ?? '—'}
-                  {f.actioned_at ? ` (actioned ${f.actioned_at})` : ' (pending)'}
-                </li>
-              ))}
+      <Card className="mb-3">
+        <Card.Body>
+          <Card.Subtitle className="text-muted mb-2">Follow-ups</Card.Subtitle>
+          {data.follow_ups.length === 0 ? (
+            <div className="text-muted small">
+              No follow-ups yet — use “Add follow-up” above to schedule one.
+            </div>
+          ) : (
+            <ul className="list-unstyled mb-0">
+              {data.follow_ups.map((f) => {
+                const busy = followUpBusyId === f.id;
+                return (
+                  <li
+                    key={f.id}
+                    className="py-2 border-bottom d-flex align-items-center"
+                  >
+                    <div className="me-auto">
+                      <span className="me-2">Due {f.due_at ?? '—'}</span>
+                      {f.auto_created && (
+                        <Badge bg="light" text="dark" className="me-2">
+                          auto
+                        </Badge>
+                      )}
+                      {f.actioned_at ? (
+                        <Badge bg="success" className="me-2">
+                          done {f.actioned_at}
+                        </Badge>
+                      ) : f.notified_at ? (
+                        <Badge bg="info" className="me-2">
+                          emailed {f.notified_at}
+                        </Badge>
+                      ) : (
+                        <Badge bg="secondary" className="me-2">
+                          pending
+                        </Badge>
+                      )}
+                      {f.notes && (
+                        <span className="text-muted small">— {f.notes}</span>
+                      )}
+                    </div>
+                    {!f.actioned_at && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline-success"
+                          className="me-2"
+                          onClick={() =>
+                            actionFollowUp(f.id, { actioned: true })
+                          }
+                          disabled={busy}
+                        >
+                          Mark done
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline-secondary"
+                          className="me-2"
+                          onClick={() => rescheduleFollowUp(f.id, f.due_at)}
+                          disabled={busy}
+                        >
+                          Reschedule
+                        </Button>
+                      </>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="outline-danger"
+                      onClick={() => deleteFollowUp(f.id)}
+                      disabled={busy}
+                    >
+                      Delete
+                    </Button>
+                  </li>
+                );
+              })}
             </ul>
-          </Card.Body>
-        </Card>
-      )}
+          )}
+        </Card.Body>
+      </Card>
 
       {data.responses.length > 0 && (
         <Card className="mb-3">

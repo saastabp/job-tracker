@@ -72,6 +72,7 @@ def test_create_submission_with_company_name_and_jd(
 
     patched_conn("handlers.submissions")
     mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    sched = mocker.patch("handlers.submissions.schedule_followup", return_value=True)
     s3 = mocker.patch.object(submissions, "_s3")
 
     # In order, the handler does:
@@ -80,9 +81,11 @@ def test_create_submission_with_company_name_and_jd(
     #   3. INSERT companies (lastrowid=88)
     #   4. INSERT submissions (lastrowid=99)
     #   5. INSERT jd_snapshots
-    #   6. _detail: SELECT submissions ...   → fetchone → submission row
+    #   6. _auto_queue_followup: SELECT users.follow_up_days → {"follow_up_days": 7}
+    #      INSERT follow_ups (lastrowid=123)
+    #   7. _detail: SELECT submissions ...   → fetchone → submission row
     #      SELECT jd_snapshots               → fetchone → snapshot row
-    #      SELECT follow_ups                 → fetchall → []
+    #      SELECT follow_ups                 → fetchall → [auto-created row]
     #      SELECT responses                  → fetchall → []
     submission_row = {
         "id": 99, "role_title": "SRE",
@@ -101,18 +104,18 @@ def test_create_submission_with_company_name_and_jd(
         "captured_at": "2026-04-28 10:00:00",
     }
     mock_cursor.fetchone.side_effect = [
-        _status_row(),     # status_id lookup
-        None,              # company name lookup miss
-        submission_row,    # _detail submission
-        snapshot_row,      # _detail jd_snapshot
+        _status_row(),                # status_id lookup
+        None,                         # company name lookup miss
+        {"follow_up_days": 7},        # auto-followup users lookup
+        submission_row,               # _detail submission
+        snapshot_row,                 # _detail jd_snapshot
     ]
     mock_cursor.fetchall.side_effect = [
-        [],  # follow_ups
+        [],  # follow_ups (none surfaced here in this fetchall stub)
         [],  # responses
     ]
-    # lastrowid is read twice: after company INSERT, then after submission INSERT.
-    type(mock_cursor).lastrowid = mocker.PropertyMock(side_effect=[88, 99])
-    # _read_jd_text in _detail makes an S3 GetObject — return a tiny body.
+    # lastrowid is read three times: company INSERT, submission INSERT, follow_ups INSERT.
+    type(mock_cursor).lastrowid = mocker.PropertyMock(side_effect=[88, 99, 123])
     s3.get_object.return_value = {
         "Body": mocker.MagicMock(read=mocker.MagicMock(return_value=b"the jd")),
     }
@@ -145,6 +148,54 @@ def test_create_submission_with_company_name_and_jd(
     assert put_kwargs["Bucket"] == "test-bucket"
     assert put_kwargs["Key"] == "users/user-sub-1/submissions/99/jd.txt"
     assert put_kwargs["Body"] == b"the jd body"
+
+    # Auto-created follow-up landed and got scheduled — submitted_on is
+    # 2026-04-28, follow_up_days is 7 → 2026-05-05 14:00 UTC.
+    sched.assert_called_once()
+    kwargs = sched.call_args.kwargs
+    assert kwargs["follow_up_id"] == 123
+    assert kwargs["due_at"].year == 2026
+    assert kwargs["due_at"].month == 5
+    assert kwargs["due_at"].day == 5
+
+
+def test_create_submission_without_submitted_on_skips_auto_followup(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Without submitted_on we don't guess a due date — auto-create is skipped."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    sched = mocker.patch("handlers.submissions.schedule_followup")
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": None, "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [
+        _status_row(),     # status_id lookup
+        submission_row,    # _detail submission
+        None,              # _detail jd_snapshot
+    ]
+    type(mock_cursor).lastrowid = mocker.PropertyMock(return_value=99)
+
+    resp = submissions.handler(
+        auth_event(
+            "POST /submissions",
+            body={"role_title": "SRE", "status": "applied"},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sched.assert_not_called()
 
 
 def test_create_submission_unknown_status_returns_400(

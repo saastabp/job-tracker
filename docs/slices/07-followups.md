@@ -1,6 +1,122 @@
-# Slice 07 — Follow-up reminders (PLAN)
+# Slice 07 — Follow-up reminders
 
-Status: planned, not started. Branch: `slice/07-followups` (TBD).
+Status: implemented. Branch: `slice/07-followups`.
+
+## What landed
+
+- New SAM stack `infra/scheduler/` (`template.yaml` + `samconfig.toml`).
+  - `AWS::Scheduler::ScheduleGroup` named `jobtracker-followups`
+    (dedicated namespace keeps the api-stack IAM scope tight).
+  - `AWS::IAM::Role` for EventBridge Scheduler with `lambda:InvokeFunction`
+    on the notify Lambda only.
+  - `jobtracker-followup-notify` Lambda — IN VPC (needs to read
+    `users.email` + `submissions` + write `follow_ups.notified_at`).
+    SES policy scoped to the verified sender identity.
+  - `AWS::SES::EmailIdentity` for the `SenderEmail` parameter
+    (default `saastabp@gmail.com`). User clicks the verification email
+    once before reminders will send.
+  - SSM params published: `/jobtracker/scheduler/group-name`,
+    `/jobtracker/scheduler/notify-arn`, `/jobtracker/scheduler/exec-role-arn`.
+- Migration `0005_followups_scheduling.sql` — adds
+  `notified_at TIMESTAMP NULL` and `auto_created BOOL DEFAULT FALSE`
+  to `follow_ups`. Schedule names are deterministic (`followup-<id>`)
+  so no `schedule_name` column.
+- `backend/src/common/scheduler.py` — `schedule_followup` /
+  `cancel_followup` helpers. Soft-fails when env vars empty (scheduler
+  stack absent → api stack still works, dashboard pending count still
+  correct, reminders just don't fire).
+- `backend/src/handlers/followups.py` (10 unit tests) —
+  GET `/follow-ups` (filterable by `?pending=1`),
+  POST `/submissions/{id}/follow-ups` (manual create),
+  PUT `/follow-ups/{id}` (edit `due_at` / `notes` / set `actioned`),
+  DELETE `/follow-ups/{id}` (soft-delete).
+  Each mutation reaches into the scheduler stack to register or cancel.
+- `submissions.py` `_auto_queue_followup` — after a successful
+  submission INSERT (and, if relevant, the JD upsert) inserts a
+  follow-up row at `submitted_on + users.follow_up_days @ 14:00 UTC`,
+  flagged `auto_created = TRUE`, schedules it. Skipped silently if
+  `submitted_on` isn't supplied; soft-fails on the schedule call.
+- `backend/src/handlers/followup_notify.py` (6 unit tests) — invoked
+  by EventBridge Scheduler with `{"follow_up_id": <int>}`. Loads the
+  row + parent submission + user email, renders a plain-text reminder,
+  sends via SES, sets `notified_at`. Idempotent: skip on already-
+  actioned / already-notified / soft-deleted rows.
+- `infra/api/template.yaml` — new `FollowUpsFunction` + scheduler:*
+  IAM grants (gated by `HasScheduler` condition: empty
+  `SchedulerGroupName` parameter → no policy emitted, no env vars set,
+  `common/scheduler` no-ops). `SubmissionsFunction` gains the same
+  scheduler permissions. Sentinel ARN-shaped defaults on the two ARN
+  parameters keep `cfn-lint` happy when the scheduler stack isn't
+  deployed.
+- Makefile: `deploy-scheduler` (depends on `deploy-data`, runs `sam
+  build && sam deploy`), `delete-scheduler` (also clears the SSM
+  params), `deploy-api` now reads `/jobtracker/scheduler/*` SSM and
+  passes `SchedulerGroupName` / `Notify` / `RoleArn` overrides when
+  present, `deploy-all` order is now
+  `network → data → auth → scheduler → api → frontend → ai →
+  wire-frontend`.
+- Frontend:
+  - `frontend/src/pages/FollowUps.tsx` — full follow-ups page (table
+    of pending follow-ups; toggle for pending-only; Mark done /
+    Delete inline actions). Linked from the new sidebar entry and
+    the dashboard "Pending follow-ups" card.
+  - `App.tsx` route `/follow-ups`. `AppShell.tsx` sidebar gains a
+    "Follow-ups" entry between Contacts and Targets.
+  - `SubmissionDetail.tsx` — disabled "Trigger follow-up" button
+    replaced with a real "Add follow-up" affordance (prompts for due
+    date, defaults to today + 7 at 14:00 UTC); inline list expanded
+    with Mark done / Reschedule / Delete buttons + "auto" / "emailed"
+    badges; FollowUp interface gains `notified_at` + `auto_created`.
+  - `Dashboard.tsx` — "Pending follow-ups" card body is now a
+    `<Link to="/follow-ups">`.
+
+## Forks resolved
+
+1. Creation path — **Both** (auto + manual). Auto creates one row at
+   `submitted_on + users.follow_up_days`, manual via the new POST
+   route + the SubmissionDetail "Add follow-up" button.
+2. Send path — **Direct SES** (recommended path accepted). Notify
+   Lambda calls `ses.send_email` in-line. Documented in
+   `common/scheduler.py`: swap to SQS+consumer later is one Lambda's
+   worth of change; nothing else moves.
+3. Submission ↔ contact linking bundle — **No** (deferred). It gets
+   its own micro-slice 08 (see plan below).
+
+## Operational notes
+
+- **First deploy of the scheduler stack** sends an SES verification
+  email to `SenderEmail`. The user must click the link before any
+  reminder will send (sandbox policy). `_send` catches missing
+  `SENDER_EMAIL` cleanly and returns `skipped:no_sender` rather than
+  raising — but a real `SES.MessageRejected` from sandbox-blocked
+  recipients will raise out of the Lambda.
+- **Tearing down the scheduler stack** (`make delete-scheduler`)
+  leaves `follow_ups` rows alone. The dashboard pending count keeps
+  working. The next `make deploy-api` re-emits the api Lambdas with
+  empty scheduler env vars and the `HasScheduler` condition omits
+  the IAM policy, restoring the api stack to scheduler-less mode
+  cleanly.
+- **Auto-create defaults to 14:00 UTC**. That's a global compromise
+  (07 PT / 10 ET / 15 UK). Per-user timezone is still deferred (see
+  `dashboard.py` time-semantics note).
+
+## Out of scope (deferred)
+
+- Email pipeline / inbound responses (`email` stack — likely slice 09).
+- Submission ↔ contact linking (slice 08, see `08-submission-contacts.md`).
+- SES production-access request (only matters if sending to
+  non-verified addresses).
+- DLQ on the notify Lambda's failures (re-add when a missed reminder
+  becomes a real complaint, not theoretical).
+- Per-user timezone (still on the `dashboard.py` deferral list).
+
+---
+
+# Original plan
+
+(below for reference)
+
+
 
 ## Why this slice next
 
