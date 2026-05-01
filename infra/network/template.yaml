@@ -114,25 +114,40 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB }
 
-  LambdaSg:
-    Type: AWS::EC2::SecurityGroup
+  # Slice 07: every Lambda is now outside the VPC; the only thing left in the
+  # so-called private subnets is RDS itself, configured with PubliclyAccessible:
+  # true so non-VPC Lambdas can reach it. RDS ingress requires the subnets
+  # to have an internet-gateway route, so both "private" route tables now
+  # carry a default 0.0.0.0/0 → IGW route. The "private" naming is preserved
+  # for now to keep the diff small; rename to "shared" or "data" in a future
+  # slice (rename = subnet replacement = RDS replacement, do separately).
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
     Properties:
-      GroupDescription: Lambdas in private subnets (default all-egress)
-      VpcId: !Ref Vpc
-      Tags:
-        - { Key: Name, Value: jobtracker-lambda-sg }
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
 
   RdsSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: RDS MySQL ingress from Lambda SG only
+      GroupDescription: RDS MySQL ingress from anywhere (IAM auth + TLS gate access)
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
-          SourceSecurityGroupId: !Ref LambdaSg
-          Description: MySQL from lambda-sg
+          CidrIp: 0.0.0.0/0
+          Description: MySQL from anywhere; IAM auth + TLS required
       Tags:
         - { Key: Name, Value: jobtracker-rds-sg }
 
@@ -167,13 +182,6 @@ Resources:
       Type: StringList
       Value: !Sub '${PublicSubnetA},${PublicSubnetB}'
 
-  SsmLambdaSgId:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /jobtracker/network/lambda-sg-id
-      Type: String
-      Value: !Ref LambdaSg
-
   SsmRdsSgId:
     Type: AWS::SSM::Parameter
     Properties:
@@ -186,7 +194,5 @@ Outputs:
     Value: !Ref Vpc
   PrivateSubnetIds:
     Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
-  LambdaSgId:
-    Value: !Ref LambdaSg
   RdsSgId:
     Value: !Ref RdsSg

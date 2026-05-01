@@ -61,15 +61,32 @@ def _parse_due_at(raw: Any) -> datetime:
         raise ValueError(f"invalid due_at: {raw!r}")
 
 
-def _verify_submission(conn: Any, user_id: int, submission_id: int) -> None:
+def _load_submission_context(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
+    """Verify submission ownership AND load the fields the schedule payload needs.
+
+    Returns a dict with ``user_email``, ``role_title``, ``company_name``,
+    ``submitted_on``. Raises ``LookupError`` if the submission isn't found or
+    isn't owned by the caller.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM submissions "
-            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            """
+            SELECT u.email AS user_email,
+                   s.role_title,
+                   s.submitted_on,
+                   c.name AS company_name
+            FROM submissions s
+            JOIN users u ON u.id = s.user_id
+            LEFT JOIN companies c ON c.id = s.company_id AND c.deleted_at IS NULL
+            WHERE s.id = %s AND s.user_id = %s
+              AND s.deleted_at IS NULL AND u.deleted_at IS NULL
+            """,
             (submission_id, user_id),
         )
-        if not cur.fetchone():
-            raise LookupError("submission not found")
+        row = cur.fetchone()
+    if not row:
+        raise LookupError("submission not found")
+    return row
 
 
 def _load_owned(conn: Any, user_id: int, follow_up_id: int) -> dict[str, Any]:
@@ -140,7 +157,7 @@ def _list(conn: Any, user_id: int, qs: dict[str, str]) -> list[dict[str, Any]]:
 def _create(
     conn: Any, user_id: int, submission_id: int, body: dict[str, Any]
 ) -> dict[str, Any]:
-    _verify_submission(conn, user_id, submission_id)
+    ctx = _load_submission_context(conn, user_id, submission_id)
     due_at = _parse_due_at(body.get("due_at"))
     notes = body.get("notes")
 
@@ -160,7 +177,17 @@ def _create(
         new_id = int(cur.lastrowid)
     conn.commit()
 
-    schedule_followup(follow_up_id=new_id, due_at=due_at)
+    schedule_followup(
+        follow_up_id=new_id,
+        due_at=due_at,
+        payload={
+            "user_email": ctx.get("user_email"),
+            "role_title": ctx.get("role_title"),
+            "company_name": ctx.get("company_name"),
+            "submitted_on": str(ctx["submitted_on"]) if ctx.get("submitted_on") else None,
+            "notes": notes,
+        },
+    )
     return _detail(conn, user_id, new_id)
 
 
@@ -240,17 +267,33 @@ def _update(
     # Side effects on the schedule, in priority order.
     #   1. If the row just became actioned, drop any pending schedule — the
     #      user has handled it; no reminder needs to fire.
-    #   2. Else if due_at changed, replace the schedule.
+    #   2. Else if due_at changed, replace the schedule (rebuild the payload
+    #      from current submission state — fields may have changed since the
+    #      row was first created).
     #   3. Else if the row was un-actioned (rare), re-create against the
-    #      current due_at so the reminder fires on the next cycle.
+    #      current due_at and current payload.
     if actioned_change is True:
         cancel_followup(follow_up_id=follow_up_id)
-    elif new_due_at is not None:
-        schedule_followup(follow_up_id=follow_up_id, due_at=new_due_at)
-    elif actioned_change is False:
-        existing_due = existing["due_at"]
-        if isinstance(existing_due, datetime):
-            schedule_followup(follow_up_id=follow_up_id, due_at=existing_due)
+    elif new_due_at is not None or actioned_change is False:
+        ctx = _load_submission_context(conn, user_id, int(existing["submission_id"]))
+        notes_for_payload = body["notes"] if "notes" in body else existing.get("notes")
+        due_for_schedule = new_due_at
+        if due_for_schedule is None:
+            existing_due = existing["due_at"]
+            if isinstance(existing_due, datetime):
+                due_for_schedule = existing_due
+        if due_for_schedule is not None:
+            schedule_followup(
+                follow_up_id=follow_up_id,
+                due_at=due_for_schedule,
+                payload={
+                    "user_email": ctx.get("user_email"),
+                    "role_title": ctx.get("role_title"),
+                    "company_name": ctx.get("company_name"),
+                    "submitted_on": str(ctx["submitted_on"]) if ctx.get("submitted_on") else None,
+                    "notes": notes_for_payload,
+                },
+            )
 
     return _detail(conn, user_id, follow_up_id)
 

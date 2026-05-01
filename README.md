@@ -2,7 +2,7 @@
 
 Web app for tracking job-search activity (resume submissions, responses, follow-ups, daily/weekly targets), built as an AWS-native serverless reference architecture.
 
-The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), submissions + companies CRUD with JD-snapshot archival to S3 (slice 03), resumes CRUD with browser-direct presigned-PUT uploads + submission linking (slice 04), contacts + outreach CRUD wired into the dashboard (slice 05), and AI-assisted resume mining + tailoring via Bedrock-backed Lambdas (slice 06). Remaining business features (SES inbound email pipeline + responses CRUD, scheduled follow-up reminders) land in follow-up slices on top of this skeleton.
+The repo started as a **foundational scaffold** — a vertical slice proving the spine end-to-end (Cognito login → JWT-authorized API call → Lambda in VPC → IAM-auth'd MySQL query → JSON back to React) — and has since grown a data model (slice 01), a dashboard with daily/weekly target widgets (slice 02), submissions + companies CRUD with JD-snapshot archival to S3 (slice 03), resumes CRUD with browser-direct presigned-PUT uploads + submission linking (slice 04), contacts + outreach CRUD wired into the dashboard (slice 05), AI-assisted resume mining + tailoring via Bedrock-backed Lambdas (slice 06), and scheduled follow-up reminders via EventBridge Scheduler + SES outbound (slice 07). Remaining business features (SES inbound email pipeline + responses CRUD, submission ↔ contact linking) land in follow-up slices on top of this skeleton.
 
 ## Architecture
 
@@ -12,19 +12,20 @@ Five SAM stacks, deployable independently and wired together via SSM Parameter S
 
 | Stack | Stability | What's in it |
 |---|---|---|
-| `network` | rarely changes | VPC, public + private subnets (2 AZs), security groups, S3 gateway endpoint |
-| `data` | "do not casually destroy" | RDS MySQL `db.t4g.micro` (IAM auth, no public access), S3 buckets (resumes, inbound email) |
+| `network` | rarely changes | VPC, two subnets in 2 AZs (RDS subnet group only), IGW + default routes, RDS security group, S3 gateway endpoint |
+| `data` | "do not casually destroy" | RDS MySQL `db.t4g.micro` (publicly accessible, IAM auth + TLS), S3 buckets (resumes, inbound email) |
 | `auth` | rarely changes | Cognito user pool, SPA app client, Hosted UI domain |
-| `api` | iterates often | HTTP API Gateway (Cognito JWT authorizer), Health Lambda in private subnets |
+| `api` | iterates often | HTTP API Gateway (Cognito JWT authorizer), Lambda handlers (all run **outside** the VPC) |
 | `frontend` | iterates often | Private S3 SPA bucket + CloudFront distribution (default `*.cloudfront.net` URL) |
 | `ai` | iterates often | HTTP API Gateway + AI Lambdas (Bedrock-backed resume mining + tailoring), runs **outside** the VPC |
+| `scheduler` | rarely changes | EventBridge Scheduler group + follow-up notify Lambda (outside the VPC, sends SES reminders directly) + SES verified sender identity |
 
-Future stacks (in follow-up plans, drop in without modifying the above): `email`, `scheduler`, `domain`, `ci`.
+Future stacks (in follow-up plans, drop in without modifying the above): `email`, `domain`, `ci`.
 
 **Key design choices** (full rationale in `infra/shared/ssm-naming.md` and the design memory):
-- No NAT gateway. Lambdas in private subnets reach AWS via VPC endpoints (S3 gateway endpoint = free; interface endpoints added only when a feature needs them).
-- IAM authentication from Lambda to MySQL. Master credential in Secrets Manager, used only for admin access via SSM Session Manager tunnel + BeeKeeper.
-- Bedrock over direct Anthropic API — no API key to manage, IAM-authed. The AI Lambdas live in the `ai` stack and run **outside** the VPC, so no Bedrock interface endpoint is needed (~$15/mo saved); they never touch the DB, all inputs come in the request body.
+- No NAT gateway, no VPC interface endpoints. Every Lambda runs **outside** the VPC; the VPC is essentially a wrapper around RDS's subnet-group requirement. Lambdas reach RDS over the public endpoint with IAM auth + TLS. The threat model is bounded — without an IAM token, attempts at the RDS endpoint just hit `Access denied`. This pattern (slice 07 flatten) replaced an earlier in-VPC topology that needed bastion + interface endpoints.
+- IAM authentication from Lambda to MySQL. Master credential in Secrets Manager; admin access is `aws rds generate-db-auth-token` + `mysql -h <public-endpoint>` from anywhere. No bastion, no SSM tunnel.
+- Bedrock over direct Anthropic API — no API key to manage, IAM-authed. The AI Lambdas live in the `ai` stack and (like every Lambda) run outside the VPC; they never touch the DB, all inputs come in the request body.
 - React SPA uses `react-oidc-context` (~30 KB) for OIDC redirect, not Amplify (~200 KB+). Hosted UI domain is the standard Cognito `*.amazoncognito.com`.
 
 ## Prerequisites
@@ -43,7 +44,6 @@ The script prints `OK` / `MISS` / `WARN` for each tool and a non-zero exit if an
 |---|---|---|---|
 | AWS CLI v2 | Deploys, queries SSM/Secrets, runs port-forward | `aws --version` (must be `aws-cli/2.x`) | `curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install` |
 | SAM CLI | Builds and deploys CloudFormation stacks | `sam --version` | `pip install --user aws-sam-cli` |
-| Session Manager plugin | Powers `make tunnel` (SSM port-forward to RDS) | `session-manager-plugin` (says "successfully installed" or similar) | `curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o /tmp/sm.deb && sudo dpkg -i /tmp/sm.deb` |
 | Node.js 20+ | Frontend build (Vite + React) | `node --version` (must be `v20.x` or higher) | `curl -fsSL https://deb.nodesource.com/setup_20.x \| sudo -E bash - && sudo apt install -y nodejs` |
 | Python 3.12+ | Local backend dev + sam build | `python3 --version` | Ubuntu 24.04: already 3.12. Older: `sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt update && sudo apt install python3.12 python3.12-venv` |
 | make | Recipe runner | `make --version` | `sudo apt install make` |
@@ -79,7 +79,7 @@ If your `default region` is something other than `us-west-2`, that's fine — ev
 
 To deploy this scaffold, the IAM principal needs broad rights to create the resources we provision. The simplest path for personal use is the AWS-managed `AdministratorAccess` policy. If you want least-privilege, you'll need create/delete on:
 
-- VPC + EC2 (subnets, route tables, IGW, security groups, EC2 instance for bastion)
+- VPC + EC2 (subnets, route tables, IGW, security groups — RDS subnet group only; no compute)
 - RDS (MySQL instance, subnet groups, IAM-auth)
 - Cognito user pools, app clients, Hosted UI domain
 - API Gateway HTTP APIs + authorizers
@@ -126,38 +126,26 @@ The SPA reads five of these (`/jobtracker/api/url`, `/jobtracker/ai/url`, `/jobt
 
 ### One-time MySQL `app` user bootstrap
 
-The Lambda authenticates to MySQL as user `app` via RDS IAM auth. That user has to exist in the database. The data stack created master credentials (`jtadmin`) but not the app user — you create it once through a transient bastion + SSM port-forward tunnel.
+The Lambda authenticates to MySQL as user `app` via RDS IAM auth. That user has to exist in the database. The data stack created master credentials (`jtadmin`) but not the app user — you create it once by connecting directly to the public RDS endpoint with the master password.
 
 ```sh
-# 1. Deploy the bastion (t4g.nano in a public subnet, SSM-managed; ~2 min)
-make -C infra deploy-bastion
-
-# 2. Print the RDS master credentials
+# 1. Print the RDS master credentials
 make -C infra db-creds
 # → {"username":"jtadmin","password":"..."}
 
-# 3. Open the tunnel (foreground; Ctrl-C to close)
-make -C infra tunnel
-# → tunnel: localhost:13306 -> jobtracker-db.xxx.us-west-2.rds.amazonaws.com:3306
+# 2. Look up the public RDS endpoint
+aws ssm get-parameter --name /jobtracker/data/db-endpoint --query Parameter.Value --output text --region us-west-2
+# → jobtracker-db.xxxxxxxx.us-west-2.rds.amazonaws.com
 ```
 
-If `deploy-bastion` fails with "We currently do not have sufficient t4g.nano capacity in the Availability Zone" (AWS hits this periodically), retry with the other AZ or a slightly larger instance:
+In BeeKeeper (or any MySQL client) point at:
 
-```sh
-BASTION_SUBNET=1 make -C infra deploy-bastion                                # us-west-2b instead of us-west-2a
-BASTION_INSTANCE_TYPE=t4g.micro make -C infra deploy-bastion                 # ~6¢/hr instead of ~3¢/hr
-BASTION_SUBNET=1 BASTION_INSTANCE_TYPE=t4g.micro make -C infra deploy-bastion # both
-```
-
-Run `make -C infra destroy-bastion` first if a previous attempt rolled back, before retrying with overrides.
-
-In another terminal, point BeeKeeper (or any MySQL client) at:
-
-- **Host**: `localhost`
-- **Port**: `13306`
+- **Host**: the endpoint from step 2
+- **Port**: `3306`
 - **User**: `jtadmin`
-- **Password**: from step 2
+- **Password**: from step 1
 - **Database**: `jobtracker`
+- **TLS**: enabled, CA = `backend/src/rds-ca-bundle.pem` (run `make -C infra fetch-rds-ca` if not yet downloaded)
 
 Run:
 
@@ -167,13 +155,7 @@ GRANT ALL PRIVILEGES ON jobtracker.* TO 'app'@'%';
 FLUSH PRIVILEGES;
 ```
 
-Then close the tunnel (Ctrl-C) and tear the bastion down to stop charges:
-
-```sh
-make -C infra destroy-bastion
-```
-
-Bastion cost: $0 when destroyed; ~3 cents/hour while running. Tighten the `app` grants once real tables exist.
+Tighten the `app` grants once real tables exist. The IAM auth + TLS gate the public endpoint; nothing here exposes the master password to the internet.
 
 ### Cognito callbacks + API CORS for the deployed frontend
 
@@ -215,9 +197,10 @@ make -C infra sync-frontend
 | `make deploy-frontend` | Yes | No parameter overrides to lose. CloudFront update can be slow (5–15 min). |
 | `make deploy-ai` | **Yes** | Auto-detects CloudFront URL from SSM, preserves CORS wiring. Standalone — does not touch `data`/`api`/`network`. |
 | `make delete-ai` | **Yes** | Tears down the AI stack and removes its SSM URL parameter. Frontend AI features show a friendly "set VITE_AI_API_URL" error until the stack is back. |
+| `make deploy-scheduler` | **Yes** | Standalone — depends only on `data`. First deploy creates an `AWS::SES::EmailIdentity` for the `SenderEmail` parameter; AWS sends a verification email and reminders won't actually fire until the link is clicked. Re-running is idempotent; the SSM params it publishes (`/jobtracker/scheduler/{group-name,notify-arn,exec-role-arn}`) get picked up by `deploy-api` automatically. |
+| `make delete-scheduler` | **Yes** | Tears down the scheduler stack + its SSM params. `follow_ups` rows persist; the dashboard pending count keeps working; reminders just stop firing. The next `make deploy-api` re-emits the api Lambdas without scheduler IAM (the `HasScheduler` condition is keyed off the empty SSM param). |
 | `make wire-frontend` | Yes (after `deploy-frontend`) | Forces re-application of the CloudFront URL to auth + api + ai (if deployed). Errors clearly if frontend not yet deployed. Mostly redundant now that the per-stack targets auto-detect, but kept for explicit-intent uses. |
 | `make sync-frontend` | Yes | Generates `.env.local` from SSM, builds, syncs to S3, invalidates CloudFront. |
-| `make deploy-bastion` / `make destroy-bastion` | Yes | Symmetric. `destroy-bastion` only removes bastion-specific resources — never touches the other stacks. |
 
 Rule of thumb: if you're not sure of the safety of a sequence, run `make deploy-all`. It's the canonical convergence command.
 
@@ -253,8 +236,7 @@ job-tracker/
 │   ├── api/                    # API Gateway + Lambdas stack
 │   ├── frontend/               # CloudFront + SPA bucket stack
 │   ├── ai/                     # Bedrock-backed AI Lambdas stack (no VPC)
-│   ├── bastion/                # transient EC2 for SSM port-forward to RDS
-│   ├── scripts/tunnel.sh       # opens SSM port-forward to RDS via bastion
+│   ├── scheduler/              # EventBridge Scheduler + follow-up notify Lambda + SES sender identity
 │   ├── shared/ssm-naming.md    # cross-stack SSM convention
 │   └── Makefile                # deploy orchestration (local convenience)
 ├── backend/                    # Python Lambda code
@@ -262,7 +244,7 @@ job-tracker/
 │   │   ├── common/             # shared: db (IAM auth), auth (JWT claims), users, logger
 │   │   ├── handlers/           # Lambda entrypoints (health, migrate, post_confirmation,
 │   │   │                       #   targets, dashboard, companies, submissions, resumes,
-│   │   │                       #   contacts, ai_mine, ai_tailor)
+│   │   │                       #   contacts, ai_mine, ai_tailor, followups, followup_notify)
 │   │   ├── migrations/         # forward-only SQL files run by handlers/migrate.py
 │   │   └── requirements.txt    # runtime deps for sam build
 │   ├── tests/                  # pytest unit tests (one test_<handler>.py per Lambda)
@@ -276,7 +258,7 @@ job-tracker/
 │   │   ├── pages/              # Dashboard, Submissions, SubmissionDetail, SubmissionForm,
 │   │   │                       #   Companies, CompanyDetail, Resumes, ResumeDetail, ResumeForm,
 │   │   │                       #   ResumeUploadModal, Contacts, ContactDetail, ContactForm,
-│   │   │                       #   Targets, Health, Login, ComingSoon
+│   │   │                       #   FollowUps, Targets, Health, Login, ComingSoon
 │   │   ├── App.tsx
 │   │   └── main.tsx
 │   ├── index.html
@@ -300,7 +282,7 @@ job-tracker/
 These are tracked for follow-up plans and have stack-shaped homes ready for them:
 
 - Email pipeline (SES inbound + processor Lambda) — `email` stack
-- Follow-up reminder scheduler (EventBridge + Lambda + SES outbound) — `scheduler` stack
+- Submission ↔ contact linking (slice 08, additive in the `api` stack)
 - Custom domain (Route 53, ACM us-east-1, CloudFront alias, Cognito custom domain, API Gateway custom domain) — `domain` stack
 - CI/CD via GitHub Actions (OIDC trust + deploy role) — `ci` stack + `.github/workflows/`
 - Responses CRUD + UI (lands with the `email` stack — responses are inbound-email-driven)

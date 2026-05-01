@@ -3,12 +3,6 @@ Transform: AWS::Serverless-2016-10-31
 Description: Job Tracker - API stack (HTTP API Gateway, Cognito JWT auth, Lambda handlers)
 
 Parameters:
-  PrivateSubnetIds:
-    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
-    Default: /jobtracker/network/private-subnet-ids
-  LambdaSgId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
-    Default: /jobtracker/network/lambda-sg-id
   DbEndpoint:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /jobtracker/data/db-endpoint
@@ -99,9 +93,6 @@ Resources:
       FunctionName: jobtracker-health
       CodeUri: ../../backend/src
       Handler: handlers.health.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -111,7 +102,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -131,9 +121,6 @@ Resources:
       CodeUri: ../../backend/src
       Handler: handlers.migrate.handler
       Timeout: 300
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -143,7 +130,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -155,9 +141,6 @@ Resources:
       FunctionName: jobtracker-post-confirmation
       CodeUri: ../../backend/src
       Handler: handlers.post_confirmation.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -167,7 +150,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -179,9 +161,6 @@ Resources:
       FunctionName: jobtracker-targets
       CodeUri: ../../backend/src
       Handler: handlers.targets.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -191,7 +170,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -216,9 +194,6 @@ Resources:
       FunctionName: jobtracker-dashboard
       CodeUri: ../../backend/src
       Handler: handlers.dashboard.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -228,7 +203,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -247,9 +221,6 @@ Resources:
       FunctionName: jobtracker-companies
       CodeUri: ../../backend/src
       Handler: handlers.companies.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -259,7 +230,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -296,9 +266,6 @@ Resources:
       FunctionName: jobtracker-submissions
       CodeUri: ../../backend/src
       Handler: handlers.submissions.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -312,7 +279,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -371,9 +337,6 @@ Resources:
       FunctionName: jobtracker-followups
       CodeUri: ../../backend/src
       Handler: handlers.followups.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -386,7 +349,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -440,9 +402,6 @@ Resources:
       FunctionName: jobtracker-contacts
       CodeUri: ../../backend/src
       Handler: handlers.contacts.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -452,7 +411,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect
@@ -507,9 +465,6 @@ Resources:
       FunctionName: jobtracker-resumes
       CodeUri: ../../backend/src
       Handler: handlers.resumes.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DbEndpoint
@@ -520,7 +475,6 @@ Resources:
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
               Action: rds-db:connect

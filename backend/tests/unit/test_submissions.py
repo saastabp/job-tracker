@@ -106,7 +106,12 @@ def test_create_submission_with_company_name_and_jd(
     mock_cursor.fetchone.side_effect = [
         _status_row(),                # status_id lookup
         None,                         # company name lookup miss
-        {"follow_up_days": 7},        # auto-followup users lookup
+        {                              # auto-followup user/submission/company JOIN
+            "follow_up_days": 7,
+            "user_email": "you@example.com",
+            "role_title": "SRE",
+            "company_name": "Acme",
+        },
         submission_row,               # _detail submission
         snapshot_row,                 # _detail jd_snapshot
     ]
@@ -157,6 +162,12 @@ def test_create_submission_with_company_name_and_jd(
     assert kwargs["due_at"].year == 2026
     assert kwargs["due_at"].month == 5
     assert kwargs["due_at"].day == 5
+    payload = kwargs["payload"]
+    assert payload["user_email"] == "you@example.com"
+    assert payload["role_title"] == "SRE"
+    assert payload["company_name"] == "Acme"
+    assert payload["submitted_on"] == "2026-04-28"
+    assert payload["notes"] is None
 
 
 def test_create_submission_without_submitted_on_skips_auto_followup(

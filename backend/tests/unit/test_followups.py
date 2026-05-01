@@ -59,6 +59,12 @@ def test_create_followup_schedules_it(
     mocker.patch("handlers.followups.get_user_id", return_value=42)
     sched = mocker.patch("handlers.followups.schedule_followup", return_value=True)
 
+    submission_ctx = {
+        "user_email": "you@example.com",
+        "role_title": "SRE",
+        "company_name": "Acme",
+        "submitted_on": "2026-04-28",
+    }
     detail_row = {
         "id": 7, "submission_id": 99,
         "due_at": "2026-05-05 09:00:00",
@@ -67,10 +73,10 @@ def test_create_followup_schedules_it(
         "auto_created": 0,
         "role_title": "SRE", "company_name": "Acme", "status": "applied",
     }
-    # _verify_submission → fetchone returns submission row, then INSERT, then _detail.
+    # _load_submission_context → fetchone returns ctx row, then INSERT, then _detail.
     mock_cursor.fetchone.side_effect = [
-        {"id": 99},  # _verify_submission
-        detail_row,  # _detail
+        submission_ctx,  # _load_submission_context
+        detail_row,      # _detail
     ]
     type(mock_cursor).lastrowid = mocker.PropertyMock(return_value=7)
 
@@ -91,6 +97,11 @@ def test_create_followup_schedules_it(
     kwargs = sched.call_args.kwargs
     assert kwargs["follow_up_id"] == 7
     assert isinstance(kwargs["due_at"], datetime)
+    payload = kwargs["payload"]
+    assert payload["user_email"] == "you@example.com"
+    assert payload["role_title"] == "SRE"
+    assert payload["company_name"] == "Acme"
+    assert payload["notes"] == "ping recruiter"
 
 
 def test_create_followup_missing_submission_returns_404(
@@ -101,7 +112,7 @@ def test_create_followup_missing_submission_returns_404(
     patched_conn("handlers.followups")
     mocker.patch("handlers.followups.get_user_id", return_value=42)
     mocker.patch("handlers.followups.schedule_followup")
-    mock_cursor.fetchone.return_value = None  # _verify_submission miss
+    mock_cursor.fetchone.return_value = None  # _load_submission_context miss
 
     resp = followups.handler(
         auth_event(
@@ -124,8 +135,13 @@ def test_create_followup_invalid_due_at_returns_400(
     patched_conn("handlers.followups")
     mocker.patch("handlers.followups.get_user_id", return_value=42)
     mocker.patch("handlers.followups.schedule_followup")
-    # _verify_submission passes; the next failure is the due_at parse.
-    mock_cursor.fetchone.return_value = {"id": 99}
+    # _load_submission_context passes; the next failure is the due_at parse.
+    mock_cursor.fetchone.return_value = {
+        "user_email": "you@example.com",
+        "role_title": "SRE",
+        "company_name": "Acme",
+        "submitted_on": "2026-04-28",
+    }
 
     resp = followups.handler(
         auth_event(
@@ -155,9 +171,16 @@ def test_update_due_at_reschedules(
         "actioned_at": None, "notified_at": None,
         "notes": None, "auto_created": 0,
     }
+    submission_ctx = {
+        "user_email": "you@example.com",
+        "role_title": "SRE",
+        "company_name": "Acme",
+        "submitted_on": "2026-04-28",
+    }
     detail_row = {**existing, "due_at": "2026-05-10 09:00:00",
                   "role_title": "SRE", "company_name": "Acme", "status": "applied"}
-    mock_cursor.fetchone.side_effect = [existing, detail_row]
+    # _load_owned, _load_submission_context (for new payload), _detail.
+    mock_cursor.fetchone.side_effect = [existing, submission_ctx, detail_row]
     mock_cursor.rowcount = 1
 
     resp = followups.handler(
@@ -171,6 +194,9 @@ def test_update_due_at_reschedules(
 
     assert resp["statusCode"] == 200
     sched.assert_called_once()
+    payload = sched.call_args.kwargs["payload"]
+    assert payload["user_email"] == "you@example.com"
+    assert payload["role_title"] == "SRE"
     cancel.assert_not_called()
 
 

@@ -5,6 +5,14 @@ register a one-shot future-dated trigger that invokes the notify Lambda owned
 by the scheduler stack. ``cancel_followup`` removes the schedule when the
 row is actioned, edited (the caller deletes-and-recreates), or soft-deleted.
 
+The schedule's Input payload carries every field the notify Lambda needs to
+render and send the email — ``user_email``, ``role_title``, ``company_name``,
+``submitted_on``, ``notes``. The notify Lambda runs OUTSIDE the VPC and never
+touches the DB, so all context must travel in the payload. Callers populate
+the dict from local context at schedule-create time; if the user later edits
+the submission's role_title, the schedule still carries the old value (fine
+for personal use; the email is informational, not authoritative).
+
 Stack segregation: if the scheduler stack isn't deployed, ``SCHEDULER_GROUP_NAME``
 will be empty and these helpers no-op (logging a warning). The follow-up row
 still persists, the dashboard still counts it, the user just doesn't get the
@@ -58,16 +66,27 @@ def _format_at(due_at: datetime) -> str:
     return due_at.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def schedule_followup(*, follow_up_id: int, due_at: datetime) -> bool:
+def schedule_followup(
+    *,
+    follow_up_id: int,
+    due_at: datetime,
+    payload: dict[str, Any],
+) -> bool:
     """Create or replace a one-shot schedule for the given follow-up.
 
     Parameters
     ----------
     follow_up_id : int
-        The local ``follow_ups.id``. Travels in the schedule's input payload
-        and identifies the row the notify Lambda should load.
+        The local ``follow_ups.id``. Embedded in the schedule's Input so the
+        notify Lambda can correlate logs back to a row, and used to derive
+        the schedule name.
     due_at : datetime
         When the schedule should fire. Coerced to UTC.
+    payload : dict
+        Reminder context the notify Lambda renders into the email — must
+        carry ``user_email``, ``role_title``, ``company_name``,
+        ``submitted_on``, ``notes`` (all strings or None). Any extra keys
+        are passed through harmlessly.
 
     Returns
     -------
@@ -85,11 +104,11 @@ def schedule_followup(*, follow_up_id: int, due_at: datetime) -> bool:
 
     name = _schedule_name(follow_up_id)
     at_expr = f"at({_format_at(due_at)})"
-    payload = json.dumps({"follow_up_id": follow_up_id})
+    input_payload = json.dumps({"follow_up_id": follow_up_id, **payload})
     target = {
         "Arn": SCHEDULER_NOTIFY_ARN,
         "RoleArn": SCHEDULER_ROLE_ARN,
-        "Input": payload,
+        "Input": input_payload,
     }
     common: dict[str, Any] = {
         "Name": name,

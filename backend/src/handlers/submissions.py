@@ -293,9 +293,12 @@ def _auto_queue_followup(
 ) -> None:
     """Insert + schedule the on-create auto follow-up.
 
-    Reads ``users.follow_up_days``, computes ``due_at = submitted_on +
-    follow_up_days`` at the auto-followup hour UTC, inserts a follow_ups row
-    flagged ``auto_created = TRUE``, and registers an EventBridge schedule.
+    Reads ``users.follow_up_days`` (alongside ``users.email`` for the schedule
+    payload + ``companies.name``/``submissions.role_title`` for the rendered
+    email), computes ``due_at = submitted_on + follow_up_days`` at the
+    auto-followup hour UTC, inserts a follow_ups row flagged ``auto_created
+    = TRUE``, and registers an EventBridge schedule whose Input carries every
+    field the (DB-less, non-VPC) notify Lambda needs.
 
     Soft-fails on every step except the row INSERT — the schedule is a
     side-effect and the dashboard pending count works without it. If we
@@ -319,11 +322,21 @@ def _auto_queue_followup(
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT follow_up_days FROM users WHERE id = %s AND deleted_at IS NULL",
-            (user_id,),
+            """
+            SELECT u.follow_up_days, u.email AS user_email,
+                   s.role_title, c.name AS company_name
+            FROM users u
+            JOIN submissions s ON s.user_id = u.id
+            LEFT JOIN companies c ON c.id = s.company_id AND c.deleted_at IS NULL
+            WHERE u.id = %s AND s.id = %s AND u.deleted_at IS NULL
+            """,
+            (user_id, submission_id),
         )
-        row = cur.fetchone()
-    days = int(row.get("follow_up_days") or 7) if row else 7
+        row = cur.fetchone() or {}
+    days = int(row.get("follow_up_days") or 7)
+    user_email = row.get("user_email")
+    role_title = row.get("role_title")
+    company_name = row.get("company_name")
 
     due_at = datetime.combine(
         base_date + timedelta(days=days),
@@ -351,7 +364,17 @@ def _auto_queue_followup(
         )
         follow_up_id = int(cur.lastrowid)
 
-    schedule_followup(follow_up_id=follow_up_id, due_at=due_at)
+    schedule_followup(
+        follow_up_id=follow_up_id,
+        due_at=due_at,
+        payload={
+            "user_email": user_email,
+            "role_title": role_title,
+            "company_name": company_name,
+            "submitted_on": str(base_date),
+            "notes": None,
+        },
+    )
 
 
 def _coerce_date(value: Any) -> date | None:

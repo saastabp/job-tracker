@@ -42,7 +42,12 @@ Resources:
       ManageMasterUserPassword: true
       DBSubnetGroupName: !Ref DbSubnetGroup
       VPCSecurityGroups: [ !Ref RdsSgId ]
-      PubliclyAccessible: false
+      # Slice 07 VPC flatten: every Lambda runs outside the VPC and reaches
+      # this instance over the public RDS endpoint. IAM auth + TLS are the
+      # gate; the master credential never leaves Secrets Manager. RDS SG
+      # allows :3306 from 0.0.0.0/0 — without an IAM token, attempts get
+      # `Access denied` at auth.
+      PubliclyAccessible: true
       MultiAZ: false
       EnableIAMDatabaseAuthentication: true
       BackupRetentionPeriod: 7

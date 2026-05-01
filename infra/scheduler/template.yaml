@@ -7,39 +7,22 @@ Description: Job Tracker - scheduler stack (EventBridge Scheduler + follow-up no
 # pending count keeps working, only future reminders stop firing. Per
 # stack-segregation rule (feedback_stacks).
 #
+# The notify Lambda runs OUTSIDE the VPC and never touches the DB — every
+# field it needs (user_email, role_title, company_name, etc.) travels in the
+# EventBridge schedule's Input payload, populated by the api-stack handlers
+# at schedule-create time. This avoids needing an SES VPC interface endpoint
+# (~$14/mo) and keeps the scheduler stack truly tearable-down.
+#
 # Order of operations on first deploy:
-#   1. deploy-data must be done (RDS exists + the app MySQL user is bootstrapped).
-#   2. deploy-scheduler creates the SES email identity → AWS sends the user a
+#   1. deploy-scheduler creates the SES email identity → AWS sends the user a
 #      verification email; the user must click the link before any reminders
 #      will send. Until verified, send_email calls fail with MessageRejected
 #      and the notify Lambda raises (logged + DLQ-able later).
-#   3. deploy-api re-runs to pick up the scheduler SSM params (group name,
+#   2. deploy-api re-runs to pick up the scheduler SSM params (group name,
 #      notify ARN, exec role ARN) and grant the api Lambdas
 #      scheduler:CreateSchedule on this group + iam:PassRole on the exec role.
 
 Parameters:
-  PrivateSubnetIds:
-    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
-    Default: /jobtracker/network/private-subnet-ids
-  LambdaSgId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
-    Default: /jobtracker/network/lambda-sg-id
-  DbEndpoint:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /jobtracker/data/db-endpoint
-  DbPort:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /jobtracker/data/db-port
-  DbName:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /jobtracker/data/db-name
-  DbResourceId:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /jobtracker/data/db-resource-id
-  DbUser:
-    Type: String
-    Default: app
-    Description: MySQL user the notify Lambda authenticates as via RDS IAM (must already exist).
   SenderEmail:
     Type: String
     Description: SES verified email used as both From and (in sandbox) the only allowed To. Defaults to the project owner's address.
@@ -103,24 +86,13 @@ Resources:
       FunctionName: jobtracker-followup-notify
       CodeUri: ../../backend/src
       Handler: handlers.followup_notify.handler
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSgId]
-        SubnetIds: !Ref PrivateSubnetIds
       Environment:
         Variables:
-          DB_HOST: !Ref DbEndpoint
-          DB_PORT: !Ref DbPort
-          DB_NAME: !Ref DbName
-          DB_USER: !Ref DbUser
           SENDER_EMAIL: !Ref SenderEmail
           POWERTOOLS_SERVICE_NAME: jobtracker
           LOG_LEVEL: INFO
       Policies:
-        - VPCAccessPolicy: {}
         - Statement:
-            - Effect: Allow
-              Action: rds-db:connect
-              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
             - Effect: Allow
               Action: ses:SendEmail
               Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SenderEmail}'

@@ -600,10 +600,6 @@ export default function SubmissionDetail() {
                         <Badge bg="success" className="me-2">
                           done {f.actioned_at}
                         </Badge>
-                      ) : f.notified_at ? (
-                        <Badge bg="info" className="me-2">
-                          emailed {f.notified_at}
-                        </Badge>
                       ) : (
                         <Badge bg="secondary" className="me-2">
                           pending

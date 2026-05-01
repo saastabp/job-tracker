@@ -1,6 +1,110 @@
-# Slice 07 — Follow-up reminders
+# Slice 07 — Follow-up reminders + VPC flatten
 
-Status: implemented. Branch: `slice/07-followups`.
+Status: code complete, deploy in progress. Branch: `slice/07-followups`.
+
+## Where we left off (resumption notes)
+
+**Code state (uncommitted on top of `b280922 WIP: Baseline commit for slice 07`):**
+- VPC flatten: every Lambda outside the VPC, RDS publicly accessible
+  with IAM auth + TLS, bastion stack deleted, scheduler interface
+  endpoint that was briefly added is gone again.
+- Schedule payload now carries `user_email` / `role_title` /
+  `company_name` / `submitted_on` / `notes`; notify Lambda is DB-less.
+- 121 backend unit tests pass; `tsc --noEmit` clean; `npm run build`
+  clean. `sam validate --lint` clean on every template except `data`,
+  which has a pre-existing unrelated EngineVersion `'8.4'` lint
+  warning.
+- Nothing is committed past `b280922`. Review the diff (`git diff
+  b280922`) and either land it as a single commit or split as
+  preferred before merging to `develop`.
+
+**Infra state (AWS):**
+- User initiated full teardown to redeploy fresh.
+- `jobtracker-network` was stuck in `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`
+  on orphaned Lambda Hyperplane ENIs pinning `LambdaSg`. Hyperplane
+  releases those in 20-45 min from the last Lambda reference. See
+  `project_lambda_eni_cleanup` memory for the SG-swap workaround if
+  you don't want to wait.
+- Other stacks may or may not be torn down depending on how far the
+  user got. Check with:
+  ```sh
+  aws cloudformation list-stacks \
+    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_COMPLETE_CLEANUP_IN_PROGRESS \
+    --region us-west-2 \
+    --query 'StackSummaries[?contains(StackName, `jobtracker`)].[StackName,StackStatus]' \
+    --output table
+  ```
+
+**Next steps when redeploying (in order):**
+1. Confirm the previous teardown finished — no `jobtracker-*` stacks
+   visible.
+2. `make -C job-tracker/infra deploy-all` — clean re-deploy of all
+   stacks in the new (flat) topology. ~15-20 min on first deploy.
+3. Click the SES verification email AWS sends to `SenderEmail`
+   (default `saastabp@gmail.com`) — until you do, follow-up reminders
+   won't actually send.
+4. Bootstrap the MySQL `app` user — README's "One-time MySQL `app`
+   user bootstrap" section now uses the public RDS endpoint directly
+   (no bastion).
+5. `make -C job-tracker/infra migrate` — applies all 5 migrations
+   including `0005_followups_scheduling.sql`.
+6. `make -C job-tracker/infra sync-frontend` — push the SPA.
+7. End-to-end test per the slice 07 test sequence (see further down
+   this doc, "What 'done' looks like" subsection — note step 6's
+   live-fire SES test).
+8. If everything works, commit the slice and merge to `develop`.
+
+**Watch out for:**
+- The data-stack reboot from the `PubliclyAccessible` flip is now
+  baked into the template defaults — clean redeploy doesn't reboot
+  anything (RDS is created public from scratch).
+- `make migrate` won't re-apply old migrations; the
+  `schema_migrations` table tracks what's been applied. A fresh DB
+  starts from migration 0001.
+- The `notified_at` column added by 0005 is now dormant; nothing
+  writes to it under the new design. Future slice can repurpose or
+  drop it.
+
+## Mid-slice deviation: VPC flatten
+
+The original slice 07 design put the new follow-up Lambdas (notify + the
+api-stack handlers calling EventBridge Scheduler) **inside the VPC** for DB
+access. First end-to-end test on the api side hung at the boto3 scheduler
+call: a VPC Lambda has no route to public AWS APIs without a NAT gateway or
+a per-service interface endpoint, and the network stack had neither. Two
+options: add interface endpoints (~$14/mo per service, violates
+`feedback_cost`), or flatten the VPC entirely. Chose the flatten:
+
+- `infra/data/template.yaml`: `PubliclyAccessible: true` on the RDS
+  instance, RDS SG opened to `0.0.0.0/0:3306` (IAM auth + TLS gate access).
+- `infra/network/template.yaml`: added a default `0.0.0.0/0 → IGW` route
+  to both "private" route tables (now a misnomer; rename deferred to a
+  later slice since renaming triggers subnet replacement). Dropped the
+  Lambda SG + its SSM param.
+- `infra/api/template.yaml` + `infra/scheduler/template.yaml`: dropped
+  `VpcConfig`, `VPCAccessPolicy`, and the network-related parameters
+  from every Function.
+- `infra/bastion/` + `infra/scripts/tunnel.sh` deleted; `make
+  deploy-bastion` / `destroy-bastion` / `tunnel` targets removed.
+- `notified_at` column added by migration `0005` is now **dormant** —
+  the notify Lambda runs outside the VPC and doesn't touch the DB, so it
+  no longer writes that column. Forward-only migrations rule means the
+  column stays in the schema; future slice can reuse or drop it.
+- Schedule Input payload now carries every field the notify Lambda
+  needs (`user_email`, `role_title`, `company_name`, `submitted_on`,
+  `notes`) — populated at schedule-create time by the api-stack
+  handlers from a JOIN over `users` + `submissions` + `companies`.
+- Frontend: dropped the "emailed" badge in `SubmissionDetail.tsx` +
+  `FollowUps.tsx` (no value to render against without
+  `notified_at`). The `notified_at` field on the FollowUp interface
+  stays — API still returns it as null.
+
+The architecture-decisions memory was updated in the same change; see
+`memory/architecture_decisions.md` "Slice 07: VPC flatten" entry for the
+canonical record.
+
+Net cost change vs the in-VPC approach: $0 ongoing (no interface
+endpoints), versus -$14/mo if we'd taken option A.
 
 ## What landed
 

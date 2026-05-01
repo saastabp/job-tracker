@@ -126,11 +126,6 @@ export default function FollowUps() {
                         auto
                       </Badge>
                     )}
-                    {r.notified_at && (
-                      <Badge bg="info" className="ms-2">
-                        emailed
-                      </Badge>
-                    )}
                   </td>
                   <td>
                     <Link to={`/submissions/${r.submission_id}`}>

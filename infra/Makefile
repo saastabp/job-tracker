@@ -1,22 +1,15 @@
 .PHONY: help check-prereqs fetch-rds-ca \
         deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-all \
-        wire-frontend migrate delete-ai delete-scheduler \
-        deploy-bastion destroy-bastion tunnel db-creds \
+        wire-frontend migrate delete-ai delete-scheduler db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
 
 REGION := us-west-2
 ROOT := $(shell git rev-parse --show-toplevel)
 
-# Bastion overrides (override on the command line if t4g.nano in subnet 0 is out of capacity):
-#   BASTION_SUBNET=1 make deploy-bastion
-#   BASTION_INSTANCE_TYPE=t4g.micro make deploy-bastion
-BASTION_SUBNET ?= 0
-BASTION_INSTANCE_TYPE ?= t4g.nano
-
 help:
 	@echo "Targets:"
-	@echo "  check-prereqs     Verify aws CLI, SAM, session-manager-plugin, node, python, etc."
+	@echo "  check-prereqs     Verify aws CLI, SAM, node, python, etc."
 	@echo "  fetch-rds-ca      Download the RDS CA bundle (run once before deploy-api)"
 	@echo "  deploy-network    Deploy VPC + subnets + S3 gateway endpoint"
 	@echo "  deploy-data       Deploy RDS MySQL + S3 buckets"
@@ -30,9 +23,6 @@ help:
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
 	@echo "  wire-frontend     Re-deploy auth + api + ai with the CloudFront URL added to callbacks/CORS"
 	@echo "  migrate           Invoke the MigrationRunner Lambda (applies pending backend/migrations/*.sql)"
-	@echo "  deploy-bastion    Deploy transient bastion EC2 (for DB admin tunnel)"
-	@echo "  destroy-bastion   Tear down bastion EC2 when admin work is done"
-	@echo "  tunnel            Open SSM port-forward to RDS (requires deploy-bastion)"
 	@echo "  db-creds          Print RDS master credentials JSON from Secrets Manager"
 	@echo "  gen-frontend-env  Write frontend/.env.local from current SSM values"
 	@echo "  dev-frontend      Generate env, npm install, run Vite dev server (localhost:5173)"
@@ -105,11 +95,12 @@ delete-ai:
 	cd $(ROOT)/infra/ai && sam delete --no-prompts
 	@aws ssm delete-parameter --name /jobtracker/ai/url --region $(REGION) 2>/dev/null || true
 
-# Scheduler stack runs INSIDE the VPC (the notify Lambda reads users/follow_ups
-# from RDS) and only depends on data + network. The api stack reads its
-# /jobtracker/scheduler/* SSM params during deploy-api (graceful no-op if
-# this stack isn't deployed). Per stack-segregation rule.
-deploy-scheduler: deploy-data
+# Scheduler stack runs OUTSIDE the VPC and only depends on auth (the notify
+# Lambda receives all reminder fields in the EventBridge Input payload, so
+# it never touches the DB). The api stack reads its /jobtracker/scheduler/*
+# SSM params during deploy-api (graceful no-op if this stack isn't
+# deployed). Per stack-segregation rule.
+deploy-scheduler:
 	cd $(ROOT)/infra/scheduler && sam build && sam deploy
 
 delete-scheduler:
@@ -144,16 +135,6 @@ wire-frontend:
 migrate:
 	aws lambda invoke --function-name jobtracker-migrate --region $(REGION) --no-cli-pager /tmp/jobtracker-migrate.json
 	@cat /tmp/jobtracker-migrate.json && echo
-
-deploy-bastion: deploy-network
-	cd $(ROOT)/infra/bastion && sam deploy \
-		--parameter-overrides PublicSubnetIndex=$(BASTION_SUBNET) InstanceType=$(BASTION_INSTANCE_TYPE)
-
-destroy-bastion:
-	cd $(ROOT)/infra/bastion && sam delete --no-prompts
-
-tunnel:
-	@$(ROOT)/infra/scripts/tunnel.sh
 
 db-creds:
 	@SECRET_ARN=$$(aws ssm get-parameter --name /jobtracker/data/db-master-secret-arn \
