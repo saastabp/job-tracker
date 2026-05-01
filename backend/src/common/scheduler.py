@@ -138,11 +138,15 @@ def schedule_followup(
                 client.update_schedule(**common)
                 return True
             except ClientError:
+                # Swallow + return False is deliberate per module docstring:
+                # the follow-up row is the source of truth, the schedule is
+                # a side-effect, and the caller logs a warning + continues.
                 logger.exception(
                     "scheduler: update_schedule failed",
                     extra={"follow_up_id": follow_up_id, "schedule_name": name},
                 )
                 return False
+        # See comment above — same graceful-degradation policy.
         logger.exception(
             "scheduler: create_schedule failed",
             extra={"follow_up_id": follow_up_id, "schedule_name": name},
@@ -188,6 +192,9 @@ def cancel_followup(*, follow_up_id: int) -> bool:
                 extra={"follow_up_id": follow_up_id, "schedule_name": name},
             )
             return True
+        # Swallow + return False per module docstring — same reasoning as
+        # schedule_followup; cancel is best-effort and the caller doesn't
+        # have a recovery path.
         logger.exception(
             "scheduler: delete_schedule failed",
             extra={"follow_up_id": follow_up_id, "schedule_name": name},

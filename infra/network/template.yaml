@@ -1,5 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Job Tracker - Network stack (VPC, subnets, security groups, S3 gateway endpoint)
+Description: Job Tracker - Network stack (VPC + subnets for the publicly-accessible RDS)
+
+# Slice 07 flatten: every Lambda runs outside the VPC, so this stack now
+# exists only because RDS instances must live in some VPC + subnet group.
+# Two subnets in different AZs (DB Subnet Group requires ≥2 AZs), an IGW
+# + default routes so RDS's PubliclyAccessible=true is actually reachable,
+# and the security group RDS attaches to. No public-subnet infrastructure
+# (no compute outside RDS), no S3 gateway endpoint (no in-VPC Lambdas).
 
 Parameters:
   VpcCidr:
@@ -17,45 +24,25 @@ Resources:
       Tags:
         - { Key: Name, Value: jobtracker-vpc }
 
-  PublicSubnetA:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref Vpc
-      CidrBlock: 10.20.0.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - { Key: Name, Value: jobtracker-public-a }
-        - { Key: tier, Value: public }
-
-  PublicSubnetB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref Vpc
-      CidrBlock: 10.20.1.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      Tags:
-        - { Key: Name, Value: jobtracker-public-b }
-        - { Key: tier, Value: public }
-
-  PrivateSubnetA:
+  DbSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.20.10.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
-        - { Key: Name, Value: jobtracker-private-a }
-        - { Key: tier, Value: private }
+        - { Key: Name, Value: jobtracker-db-a }
+        - { Key: tier, Value: db }
 
-  PrivateSubnetB:
+  DbSubnetB:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.20.11.0/24
       AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
-        - { Key: Name, Value: jobtracker-private-b }
-        - { Key: tier, Value: private }
+        - { Key: Name, Value: jobtracker-db-b }
+        - { Key: tier, Value: db }
 
   Igw:
     Type: AWS::EC2::InternetGateway
@@ -69,71 +56,44 @@ Resources:
       VpcId: !Ref Vpc
       InternetGatewayId: !Ref Igw
 
-  PublicRouteTable:
+  DbRouteTableA:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
       Tags:
-        - { Key: Name, Value: jobtracker-public-rt }
+        - { Key: Name, Value: jobtracker-db-rt-a }
 
-  PublicDefaultRoute:
+  DbRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: jobtracker-db-rt-b }
+
+  DbSubnetARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetA, RouteTableId: !Ref DbRouteTableA }
+
+  DbSubnetBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetB, RouteTableId: !Ref DbRouteTableB }
+
+  # IGW default routes are what make RDS's PubliclyAccessible=true work —
+  # without these, AWS still gives the instance a public IP and DNS name
+  # but the subnets have no path for inbound traffic to land.
+  DbDefaultRouteA:
     Type: AWS::EC2::Route
     DependsOn: IgwAttach
     Properties:
-      RouteTableId: !Ref PublicRouteTable
+      RouteTableId: !Ref DbRouteTableA
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref Igw
 
-  PublicSubnetARtAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
-
-  PublicSubnetBRtAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
-
-  PrivateRouteTableA:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref Vpc
-      Tags:
-        - { Key: Name, Value: jobtracker-private-rt-a }
-
-  PrivateRouteTableB:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref Vpc
-      Tags:
-        - { Key: Name, Value: jobtracker-private-rt-b }
-
-  PrivateSubnetARtAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTableA }
-
-  PrivateSubnetBRtAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB }
-
-  # Slice 07: every Lambda is now outside the VPC; the only thing left in the
-  # so-called private subnets is RDS itself, configured with PubliclyAccessible:
-  # true so non-VPC Lambdas can reach it. RDS ingress requires the subnets
-  # to have an internet-gateway route, so both "private" route tables now
-  # carry a default 0.0.0.0/0 → IGW route. The "private" naming is preserved
-  # for now to keep the diff small; rename to "shared" or "data" in a future
-  # slice (rename = subnet replacement = RDS replacement, do separately).
-  PrivateDefaultRouteA:
+  DbDefaultRouteB:
     Type: AWS::EC2::Route
     DependsOn: IgwAttach
     Properties:
-      RouteTableId: !Ref PrivateRouteTableA
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref Igw
-
-  PrivateDefaultRouteB:
-    Type: AWS::EC2::Route
-    DependsOn: IgwAttach
-    Properties:
-      RouteTableId: !Ref PrivateRouteTableB
+      RouteTableId: !Ref DbRouteTableB
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref Igw
 
@@ -151,16 +111,6 @@ Resources:
       Tags:
         - { Key: Name, Value: jobtracker-rds-sg }
 
-  S3GatewayEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcId: !Ref Vpc
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
-      VpcEndpointType: Gateway
-      RouteTableIds:
-        - !Ref PrivateRouteTableA
-        - !Ref PrivateRouteTableB
-
   SsmVpcId:
     Type: AWS::SSM::Parameter
     Properties:
@@ -168,19 +118,12 @@ Resources:
       Type: String
       Value: !Ref Vpc
 
-  SsmPrivateSubnetIds:
+  SsmDbSubnetIds:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: /jobtracker/network/private-subnet-ids
+      Name: /jobtracker/network/db-subnet-ids
       Type: StringList
-      Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
-
-  SsmPublicSubnetIds:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /jobtracker/network/public-subnet-ids
-      Type: StringList
-      Value: !Sub '${PublicSubnetA},${PublicSubnetB}'
+      Value: !Sub '${DbSubnetA},${DbSubnetB}'
 
   SsmRdsSgId:
     Type: AWS::SSM::Parameter
@@ -192,7 +135,7 @@ Resources:
 Outputs:
   VpcId:
     Value: !Ref Vpc
-  PrivateSubnetIds:
-    Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
+  DbSubnetIds:
+    Value: !Sub '${DbSubnetA},${DbSubnetB}'
   RdsSgId:
     Value: !Ref RdsSg

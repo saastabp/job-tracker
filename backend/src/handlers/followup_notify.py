@@ -72,35 +72,46 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     follow_up_id = event.get("follow_up_id")
     logger.info("followup_notify: enter", extra={"follow_up_id": follow_up_id})
 
-    if follow_up_id is None:
-        logger.error("followup_notify: missing follow_up_id in event")
-        raise ValueError("event missing follow_up_id")
-
-    user_email = event.get("user_email")
-    if not user_email:
-        logger.error(
-            "followup_notify: user_email missing from payload",
-            extra={"follow_up_id": follow_up_id},
-        )
-        return {"follow_up_id": int(follow_up_id), "status": "skipped:no_email"}
-
-    if not SENDER_EMAIL:
-        logger.error(
-            "followup_notify: SENDER_EMAIL env var unset, cannot send",
-            extra={"follow_up_id": follow_up_id},
-        )
-        return {"follow_up_id": int(follow_up_id), "status": "skipped:no_sender"}
-
-    subject, body = _render(event)
-    logger.info(
-        "followup_notify: sending email",
-        extra={
-            "follow_up_id": follow_up_id,
-            "to": user_email,
-            "subject": subject,
-        },
-    )
     try:
+        if follow_up_id is None:
+            raise ValueError("event missing follow_up_id")
+
+        user_email = event.get("user_email")
+        if not user_email:
+            # Skip + log, don't raise — payload from a stale schedule shouldn't
+            # blow up Hyperplane retries; the deliverable email is missing
+            # anyway, no recovery is possible for THIS attempt.
+            logger.warning(
+                "followup_notify: user_email missing from payload, skipping",
+                extra={"follow_up_id": follow_up_id},
+            )
+            logger.info(
+                "followup_notify: exit ok",
+                extra={"follow_up_id": follow_up_id, "status": "skipped:no_email"},
+            )
+            return {"follow_up_id": int(follow_up_id), "status": "skipped:no_email"}
+
+        if not SENDER_EMAIL:
+            # Same: a misconfigured stack shouldn't cause SES retries to spin.
+            logger.warning(
+                "followup_notify: SENDER_EMAIL env var unset, skipping",
+                extra={"follow_up_id": follow_up_id},
+            )
+            logger.info(
+                "followup_notify: exit ok",
+                extra={"follow_up_id": follow_up_id, "status": "skipped:no_sender"},
+            )
+            return {"follow_up_id": int(follow_up_id), "status": "skipped:no_sender"}
+
+        subject, body = _render(event)
+        logger.info(
+            "followup_notify: sending email",
+            extra={
+                "follow_up_id": follow_up_id,
+                "to": user_email,
+                "subject": subject,
+            },
+        )
         _get_ses().send_email(
             Source=SENDER_EMAIL,
             Destination={"ToAddresses": [user_email]},
@@ -109,15 +120,14 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
                 "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
             },
         )
+        logger.info(
+            "followup_notify: exit ok",
+            extra={"follow_up_id": follow_up_id, "status": "sent"},
+        )
+        return {"follow_up_id": int(follow_up_id), "status": "sent"}
     except Exception:
         logger.exception(
-            "followup_notify: SES send failed",
-            extra={"follow_up_id": follow_up_id, "to": user_email},
+            "followup_notify: failed",
+            extra={"follow_up_id": follow_up_id},
         )
         raise
-
-    logger.info(
-        "followup_notify: exit ok",
-        extra={"follow_up_id": follow_up_id, "status": "sent"},
-    )
-    return {"follow_up_id": int(follow_up_id), "status": "sent"}

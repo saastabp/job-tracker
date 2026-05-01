@@ -209,6 +209,63 @@ def test_create_submission_without_submitted_on_skips_auto_followup(
     sched.assert_not_called()
 
 
+def test_create_submission_honors_follow_up_days_zero(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Regression: ``follow_up_days = 0`` must produce a same-day due_at.
+
+    Earlier code did ``int(row.get("follow_up_days") or 7)`` which silently
+    rewrote 0 → 7 because ``0`` is falsy in Python.
+    """
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    sched = mocker.patch("handlers.submissions.schedule_followup", return_value=True)
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [
+        _status_row(),                # status_id lookup
+        {                              # auto-followup user JOIN
+            "follow_up_days": 0,
+            "user_email": "you@example.com",
+            "role_title": "SRE",
+            "company_name": None,
+        },
+        submission_row,               # _detail submission
+        None,                         # _detail jd_snapshot
+    ]
+    mock_cursor.fetchall.side_effect = [[], []]
+    type(mock_cursor).lastrowid = mocker.PropertyMock(side_effect=[99, 123])
+
+    resp = submissions.handler(
+        auth_event(
+            "POST /submissions",
+            body={
+                "role_title": "SRE",
+                "status": "applied",
+                "submitted_on": "2026-04-28",
+            },
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sched.assert_called_once()
+    due_at = sched.call_args.kwargs["due_at"]
+    # 0-day window → same-day due_at, NOT the 7-day fallback.
+    assert (due_at.year, due_at.month, due_at.day) == (2026, 4, 28)
+
+
 def test_create_submission_unknown_status_returns_400(
     mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
 ):

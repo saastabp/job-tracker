@@ -333,7 +333,8 @@ def _auto_queue_followup(
             (user_id, submission_id),
         )
         row = cur.fetchone() or {}
-    days = int(row.get("follow_up_days") or 7)
+    raw_days = row.get("follow_up_days")
+    days = int(raw_days) if raw_days is not None else 7
     user_email = row.get("user_email")
     role_title = row.get("role_title")
     company_name = row.get("company_name")

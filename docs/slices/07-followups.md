@@ -5,44 +5,69 @@ Status: code complete, deploy in progress. Branch: `slice/07-followups`.
 ## Where we left off (resumption notes)
 
 **Code state (uncommitted on top of `b280922 WIP: Baseline commit for slice 07`):**
-- VPC flatten: every Lambda outside the VPC, RDS publicly accessible
-  with IAM auth + TLS, bastion stack deleted, scheduler interface
-  endpoint that was briefly added is gone again.
-- Schedule payload now carries `user_email` / `role_title` /
-  `company_name` / `submitted_on` / `notes`; notify Lambda is DB-less.
-- 121 backend unit tests pass; `tsc --noEmit` clean; `npm run build`
-  clean. `sam validate --lint` clean on every template except `data`,
-  which has a pre-existing unrelated EngineVersion `'8.4'` lint
-  warning.
-- Nothing is committed past `b280922`. Review the diff (`git diff
-  b280922`) and either land it as a single commit or split as
-  preferred before merging to `develop`.
 
-**Infra state (AWS):**
-- User initiated full teardown to redeploy fresh.
-- `jobtracker-network` was stuck in `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`
-  on orphaned Lambda Hyperplane ENIs pinning `LambdaSg`. Hyperplane
-  releases those in 20-45 min from the last Lambda reference. See
-  `project_lambda_eni_cleanup` memory for the SG-swap workaround if
-  you don't want to wait.
-- Other stacks may or may not be torn down depending on how far the
-  user got. Check with:
-  ```sh
-  aws cloudformation list-stacks \
-    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_COMPLETE_CLEANUP_IN_PROGRESS \
-    --region us-west-2 \
-    --query 'StackSummaries[?contains(StackName, `jobtracker`)].[StackName,StackStatus]' \
-    --output table
-  ```
+Two rounds of edits since the WIP baseline:
+
+Round 1 — VPC flatten (covered earlier in this doc, "Mid-slice
+deviation: VPC flatten"):
+- Every Lambda outside the VPC; RDS publicly accessible (IAM auth +
+  TLS); bastion stack deleted; payload carries reminder fields so
+  notify Lambda is DB-less.
+
+Round 2 — network/data cleanup + cosmetic + logging compliance:
+- `infra/network/template.yaml` fully restructured: Private→Db
+  rename across all subnets / route tables / SSM key
+  (`/jobtracker/network/db-subnet-ids`) / output. Dropped 2 public
+  subnets, public route table + assocs, S3 gateway endpoint,
+  `SsmPublicSubnetIds`. Resource count down 22 → 12.
+- `infra/data/template.yaml`: parameter rename `PrivateSubnetIds` →
+  `DbSubnetIds` with matching SSM Default; DBSubnetGroup
+  `Description` updated to "jobtracker db subnets".
+- `backend/src/handlers/followup_notify.py`: handler body wrapped
+  in top-level `try/except → logger.exception → raise`; early-return
+  guards switched to `logger.warning` + `exit ok` log lines.
+- `backend/src/common/scheduler.py`: inline justification comments
+  at the three swallow-and-return-False catch sites.
+- `CLAUDE.md` (new sections at top): "Confirm before editing code or
+  infra" + "Lambda logging" + "Suggested shell commands". The repo
+  now mirrors the standing rules in memory.
+
+121 backend unit tests pass; `tsc --noEmit` clean; `npm run build`
+clean. `sam validate --lint` clean on every template except `data`,
+which has a pre-existing unrelated EngineVersion `'8.4'` lint
+warning (RDS API itself accepts the major-version shorthand).
+
+Nothing is committed past `b280922`. Review the diff (`git diff
+b280922`) and either land it as a single commit or split as
+preferred before merging to `develop`.
+
+**Infra state (AWS) at session close:**
+- All `jobtracker-*` CFN stacks were torn down successfully.
+- The user re-ran `make deploy-all`. `deploy-network` succeeded.
+  `deploy-data` failed Early Validation
+  (`AWS::EarlyValidation::ResourceExistenceCheck`) because the
+  S3 buckets from the prior deploy still existed (DeletionPolicy:
+  Retain). User manually emptied + deleted three orphan buckets:
+  `jobtracker-resumes-<acct>`, `jobtracker-inbound-email-<acct>`,
+  and the SPA bucket. Was about to retry `make deploy-all` when
+  they paused.
+- See `project_retain_buckets_block_redeploy` memory for the full
+  pattern; relevant on every future fresh redeploy until/unless the
+  Retain policies get flipped (see "Possible follow-up" in that
+  memory).
 
 **Next steps when redeploying (in order):**
-1. Confirm the previous teardown finished — no `jobtracker-*` stacks
-   visible.
-2. `make -C job-tracker/infra deploy-all` — clean re-deploy of all
-   stacks in the new (flat) topology. ~15-20 min on first deploy.
+1. Quick check: `aws cloudformation describe-stacks --stack-name
+   jobtracker-data --region us-west-2 --query
+   'Stacks[0].StackStatus' --output text`. If it returns
+   `REVIEW_IN_PROGRESS`, the failed-changeset attempt left a stub
+   stack — delete it: `aws cloudformation delete-stack --stack-name
+   jobtracker-data --region us-west-2`.
+2. `make -C job-tracker/infra deploy-all` — should now sail past
+   the bucket conflict and complete in ~15-20 min.
 3. Click the SES verification email AWS sends to `SenderEmail`
-   (default `saastabp@gmail.com`) — until you do, follow-up reminders
-   won't actually send.
+   (default `saastabp@gmail.com`) — until you do, follow-up
+   reminders won't actually send.
 4. Bootstrap the MySQL `app` user — README's "One-time MySQL `app`
    user bootstrap" section now uses the public RDS endpoint directly
    (no bastion).

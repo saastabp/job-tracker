@@ -2,9 +2,9 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Job Tracker - Data stack (RDS MySQL, S3 buckets)
 
 Parameters:
-  PrivateSubnetIds:
+  DbSubnetIds:
     Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
-    Default: /jobtracker/network/private-subnet-ids
+    Default: /jobtracker/network/db-subnet-ids
   RdsSgId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
     Default: /jobtracker/network/rds-sg-id
@@ -20,8 +20,8 @@ Resources:
   DbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: jobtracker private subnets
-      SubnetIds: !Ref PrivateSubnetIds
+      DBSubnetGroupDescription: jobtracker db subnets
+      SubnetIds: !Ref DbSubnetIds
       Tags:
         - { Key: Name, Value: jobtracker-db-subnets }
 
