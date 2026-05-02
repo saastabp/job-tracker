@@ -31,12 +31,29 @@ All cross-stack values flow through SSM Parameter Store under `/jobtracker/<conc
 
 ### `api` (producer: `infra/api/template.yaml`)
 - `/jobtracker/api/url`
+- `/jobtracker/api/post-confirmation-function-arn` — read by `deploy-auth` to wire the Cognito post-confirmation Lambda
 
 ### `frontend` (producer: `infra/frontend/template.yaml`)
 - `/jobtracker/frontend/cloudfront-domain`
 - `/jobtracker/frontend/cloudfront-url`
 - `/jobtracker/frontend/spa-bucket-name`
 - `/jobtracker/frontend/distribution-id`
+
+### `ai` (producer: `infra/ai/template.yaml`)
+- `/jobtracker/ai/url` — base URL of the AI HTTP API; consumed by the SPA via `VITE_AI_API_URL`
+
+### `scheduler` (producer: `infra/scheduler/template.yaml`)
+- `/jobtracker/scheduler/group-name` — EventBridge Scheduler group for follow-up reminders
+- `/jobtracker/scheduler/notify-arn` — ARN of the notify Lambda the scheduler invokes
+- `/jobtracker/scheduler/exec-role-arn` — role EventBridge Scheduler assumes to invoke the notify Lambda
+
+The api stack reads all three of these at deploy-time to wire IAM for `scheduler:CreateSchedule`. Empty `group-name` (when the scheduler stack isn't deployed) flips a `HasScheduler` condition that omits the IAM bindings entirely — submissions then no-op the schedule write, reminders simply don't fire.
+
+### `dns` (producer: `infra/dns/template.yaml`, but written by `deploy-dns` Makefile target)
+- `/jobtracker/dns/cert-arn` — ACM certificate ARN (us-east-1)
+- `/jobtracker/dns/app-url` — `https://<custom-domain>` for the SPA
+
+These live in **us-west-2 SSM** even though the dns stack runs in us-east-1. The Makefile reads the dns stack's outputs after `sam deploy` and writes them here so the rest of the recipes (which all read SSM in us-west-2) don't need cross-region awareness. Empty when the dns stack isn't deployed; `deploy-frontend` skips the alias attach in that case.
 
 ## How consumer stacks read params
 

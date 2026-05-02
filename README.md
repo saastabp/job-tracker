@@ -6,9 +6,9 @@ The repo started as a **foundational scaffold** — a vertical slice proving the
 
 ## Architecture
 
-Region: **us-west-2**. ACM cert for CloudFront (added with the future `domain` stack) goes in **us-east-1**.
+Region: **us-west-2** for everything except the `dns` stack, which is in **us-east-1** because CloudFront's viewer certificate must be issued there.
 
-Five SAM stacks, deployable independently and wired together via SSM Parameter Store under `/jobtracker/<concern>/<resource>` (see [`infra/shared/ssm-naming.md`](infra/shared/ssm-naming.md)):
+SAM stacks, deployable independently and wired together via SSM Parameter Store under `/jobtracker/<concern>/<resource>` (see [`infra/shared/ssm-naming.md`](infra/shared/ssm-naming.md)):
 
 | Stack | Stability | What's in it |
 |---|---|---|
@@ -16,11 +16,12 @@ Five SAM stacks, deployable independently and wired together via SSM Parameter S
 | `data` | "do not casually destroy" | RDS MySQL `db.t4g.micro` (publicly accessible, IAM auth + TLS), S3 buckets (resumes, inbound email) |
 | `auth` | rarely changes | Cognito user pool, SPA app client, Hosted UI domain |
 | `api` | iterates often | HTTP API Gateway (Cognito JWT authorizer), Lambda handlers (all run **outside** the VPC) |
-| `frontend` | iterates often | Private S3 SPA bucket + CloudFront distribution (default `*.cloudfront.net` URL) |
+| `frontend` | iterates often | Private S3 SPA bucket + CloudFront distribution (default `*.cloudfront.net` URL; optional custom-domain alias from `dns` stack) |
 | `ai` | iterates often | HTTP API Gateway + AI Lambdas (Bedrock-backed resume mining + tailoring), runs **outside** the VPC |
 | `scheduler` | rarely changes | EventBridge Scheduler group + follow-up notify Lambda (outside the VPC, sends SES reminders directly) + SES verified sender identity |
+| `dns` | rarely changes; **us-east-1** | ACM cert (DNS-validated against your hosted zone) + Route 53 A/AAAA alias records → CloudFront. Opt-in; not in `deploy-all`'s dep chain. |
 
-Future stacks (in follow-up plans, drop in without modifying the above): `email`, `domain`, `ci`.
+Future stacks (in follow-up plans, drop in without modifying the above): `email`, `ci`.
 
 **Key design choices** (full rationale in `infra/shared/ssm-naming.md` and the design memory):
 - No NAT gateway, no VPC interface endpoints. Every Lambda runs **outside** the VPC; the VPC is essentially a wrapper around RDS's subnet-group requirement. Lambdas reach RDS over the public endpoint with IAM auth + TLS. The threat model is bounded — without an IAM token, attempts at the RDS endpoint just hit `Access denied`. This pattern (slice 07 flatten) replaced an earlier in-VPC topology that needed bastion + interface endpoints.
@@ -223,7 +224,9 @@ Once Bedrock is configured in the region, flip the default by changing `AI_ENABL
 | `make delete-ai` | **Yes** | Tears down the AI stack and removes its SSM URL parameter. Frontend AI features show a friendly "set VITE_AI_API_URL" error until the stack is back. |
 | `make deploy-scheduler` | **Yes** | Standalone — depends only on `data`. First deploy creates an `AWS::SES::EmailIdentity` for the `SenderEmail` parameter; AWS sends a verification email and reminders won't actually fire until the link is clicked. Re-running is idempotent; the SSM params it publishes (`/jobtracker/scheduler/{group-name,notify-arn,exec-role-arn}`) get picked up by `deploy-api` automatically. |
 | `make delete-scheduler` | **Yes** | Tears down the scheduler stack + its SSM params. `follow_ups` rows persist; the dashboard pending count keeps working; reminders just stop firing. The next `make deploy-api` re-emits the api Lambdas without scheduler IAM (the `HasScheduler` condition is keyed off the empty SSM param). |
-| `make wire-frontend` | Yes (after `deploy-frontend`) | Forces re-application of the CloudFront URL to auth + api + ai (if deployed). Errors clearly if frontend not yet deployed. Mostly redundant now that the per-stack targets auto-detect, but kept for explicit-intent uses. |
+| `make deploy-dns` | **Yes** | Opt-in custom-domain attach. Deploys the dns stack in us-east-1, writes cert ARN + app URL to SSM, then re-runs `deploy-frontend` to attach the alias. Blocks ~5–15 min on ACM validation. Standalone-safe. See [`docs/dns-setup.md`](docs/dns-setup.md). |
+| `make delete-dns` | **Yes** | Tears down the dns stack and its SSM params. The next `deploy-frontend` will fall back to the default cloudfront.net domain. Cognito/CORS allow-lists keep the old origin until the next `wire-frontend` rebuilds them — harmless but noisy. |
+| `make wire-frontend` | Yes (after `deploy-frontend`) | Forces re-application of the CloudFront URL (and custom-domain URL, if `dns` stack is deployed) to auth + api + ai. Errors clearly if frontend not yet deployed. Mostly redundant now that the per-stack targets auto-detect, but kept for explicit-intent uses. |
 | `make sync-frontend` | Yes | Generates `.env.local` from SSM, builds, syncs to S3, invalidates CloudFront. |
 
 Rule of thumb: if you're not sure of the safety of a sequence, run `make deploy-all`. It's the canonical convergence command.
@@ -261,6 +264,7 @@ job-tracker/
 │   ├── frontend/               # CloudFront + SPA bucket stack
 │   ├── ai/                     # Bedrock-backed AI Lambdas stack (no VPC)
 │   ├── scheduler/              # EventBridge Scheduler + follow-up notify Lambda + SES sender identity
+│   ├── dns/                    # us-east-1 ACM cert + Route 53 alias for custom-domain CloudFront (opt-in)
 │   ├── shared/ssm-naming.md    # cross-stack SSM convention
 │   └── Makefile                # deploy orchestration (local convenience)
 ├── backend/                    # Python Lambda code
@@ -307,7 +311,7 @@ These are tracked for follow-up plans and have stack-shaped homes ready for them
 
 - Email pipeline (SES inbound + processor Lambda) — `email` stack
 - Submission ↔ contact linking (slice 08, additive in the `api` stack)
-- Custom domain (Route 53, ACM us-east-1, CloudFront alias, Cognito custom domain, API Gateway custom domain) — `domain` stack
+- Cognito custom domain + API Gateway custom domain. The SPA's custom-domain alias is shipped via the `dns` stack; folding the Cognito Hosted UI and the API endpoint behind matching subdomains is still pending and would extend the `dns` stack rather than add a new one.
 - CI/CD via GitHub Actions (OIDC trust + deploy role) — `ci` stack + `.github/workflows/`
 - Responses CRUD + UI (lands with the `email` stack — responses are inbound-email-driven)
 - AI response classification (lands with the `email` stack — needs the inbound email body, which doesn't exist yet)

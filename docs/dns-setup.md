@@ -1,72 +1,70 @@
-# DNS / custom-domain setup — in progress
+# DNS / custom-domain setup — shipped 2026-05-02
 
-Standalone infra task done outside any slice. Goal: serve the SPA at
-`https://jobs.kololecat.link` instead of the bare CloudFront domain.
+Standalone infra task done outside any slice. Result: SPA is served at
+`https://jobs.kololecat.link` with an ACM cert in us-east-1 and a Route 53
+alias record fronting the CloudFront distribution.
 
-## State as of 2026-05-02
+## Final state
 
-- **Domain:** `kololecat.link` registration in flight via Route 53 Domains
-  (us-east-1). Was switched from `crazylittledog.link` after that domain
-  turned out to have a hosted zone but no actual TLD delegation, which
-  silently stalled ACM validation for 8+ hours. Previous broken stack
-  and hosted zone have been deleted.
-- **Hosted zone (kept):** `Z0729608URC9WKRYW5YI` — the registrar-created
-  zone. NS records visible in console: `awsdns-54.com / 55.org / 31.co.uk
-  / 54.net`. Duplicate manual zone for the same name was deleted.
-- **Code in place** (uncommitted on branch `slice/08-submission-contacts`):
-  - `infra/dns/template.yaml` — us-east-1 stack: ACM cert (DNS-validated,
-    auto-write CNAME via `DomainValidationOptions.HostedZoneId`) +
-    Route 53 A/AAAA alias records pointing at the SPA's CloudFront.
-    Defaults baked in: `HostedZoneId=Z0729608URC9WKRYW5YI`,
-    `AppDomain=jobs.kololecat.link`.
-  - `infra/dns/samconfig.toml` — `stack_name=jobtracker-dns`,
-    `region=us-east-1`.
-  - `infra/frontend/template.yaml` — added optional `AppDomain` +
-    `CertificateArn` parameters and `HasCustomDomain` condition that
-    gates `Aliases` + `ViewerCertificate`. Empty defaults preserve
-    cloudfront.net-only behavior.
-  - `infra/Makefile` — new `deploy-dns` (depends on `deploy-frontend`,
-    runs `sam deploy` in us-east-1, writes cert ARN + app URL to
-    us-west-2 SSM, then re-invokes `deploy-frontend` so the alias
-    attaches in one shot per the idempotent-individual-deploys rule).
-    New `delete-dns`. Updated `deploy-frontend`, `deploy-auth`,
-    `deploy-api`, `deploy-ai`, `wire-frontend` to thread
-    `/jobtracker/dns/app-url` through callbacks/CORS when present.
-    `deploy-dns` deliberately not in `deploy-all`'s dep chain — opt-in
-    upgrade.
+- **Domain:** `kololecat.link`, registered via Route 53 Domains, expires
+  2027-05-02. (Earlier attempt at `crazylittledog.link` was abandoned —
+  hosted zone existed but the domain was never registered at the .link
+  TLD, which silently stalled ACM validation for 8+ hours. Lesson saved
+  to memory: `dig NS <domain> @8.8.8.8 +short` is now a prerequisite
+  check before relying on auto-validation.)
+- **Hosted zone:** `Z0729608URC9WKRYW5YI` — registrar-created, NS
+  records `awsdns-54.com / 55.org / 31.co.uk / 54.net`, delegated at
+  the .link TLD.
+- **SSM (us-west-2):** `/jobtracker/dns/cert-arn` and
+  `/jobtracker/dns/app-url=https://jobs.kololecat.link` — written by
+  `deploy-dns` after the us-east-1 stack outputs them.
 
-## Resume runbook (when registration finishes)
+## Files
 
-1. **Verify the .link TLD has the delegation** (the step that should
-   have been done before the prior failed attempt):
+- `infra/dns/template.yaml` — us-east-1 stack: ACM cert (DNS-validated
+  via `DomainValidationOptions.HostedZoneId`) + Route 53 A/AAAA alias
+  records pointing at the SPA's CloudFront distribution. Defaults
+  baked in: `HostedZoneId=Z0729608URC9WKRYW5YI`,
+  `AppDomain=jobs.kololecat.link`.
+- `infra/dns/samconfig.toml` — `stack_name=jobtracker-dns`,
+  `region=us-east-1`.
+- `infra/frontend/template.yaml` — optional `AppDomain` +
+  `CertificateArn` parameters and a `HasCustomDomain` condition that
+  gates `Aliases` + `ViewerCertificate { sni-only, TLSv1.2_2021 }`.
+  Empty defaults preserve the cloudfront.net-only behavior.
+- `infra/Makefile` — `deploy-dns` / `delete-dns` targets, plus
+  `deploy-frontend`, `deploy-auth`, `deploy-api`, `deploy-ai`, and
+  `wire-frontend` thread `/jobtracker/dns/app-url` through
+  Cognito callbacks and API/AI CORS when the SSM param exists.
+  `deploy-dns` is intentionally *not* in `deploy-all`'s dep chain —
+  custom domain is opt-in.
 
-       dig NS kololecat.link @8.8.8.8 +short
+## Operational notes
 
-   Expect four `awsdns-*` nameservers. If empty, the domain isn't
-   delegated yet — wait. `aws route53domains get-domain-detail
-   --domain-name kololecat.link --region us-east-1` should return
-   without error once registration is committed.
+### Idempotency
 
-2. **Deploy:**
+`make deploy-dns` is standalone-safe: it deploys the dns stack,
+writes the cert ARN + app URL to SSM, then re-runs `deploy-frontend`
+to attach the alias in the same shot. (Earlier ran into a one-time
+glitch where the recursive `$(MAKE) deploy-frontend` didn't fire,
+leaving the cert issued but the alias unattached and CloudFront
+returning 403. Re-running `make deploy-frontend` once SSM is populated
+is the recovery path. Recipe is now in place to handle this in one
+invocation, but worth knowing if it ever gets stuck again.)
 
-       make -C infra deploy-dns
+### Tearing down
 
-   This blocks on ACM validation (typically 5–15 min once delegation is
-   in place), then re-runs `deploy-frontend` to attach the alias.
+`make delete-dns` deletes the stack (cert + alias records) and the two
+SSM params. The next `make deploy-frontend` will see empty SSM params
+and re-deploy the distribution without aliases — falling back to the
+default cloudfront.net domain. Cognito callbacks / API CORS will
+*still* contain the custom origin until the next `wire-frontend`
+clears it (no harm, just noise).
 
-3. **Wire callbacks + CORS:**
+### Re-deploying or migrating to a new domain
 
-       make -C infra wire-frontend
-
-4. **Republish SPA + invalidate CloudFront:**
-
-       make -C infra sync-frontend
-
-5. **Smoke test:** `https://jobs.kololecat.link/` should load and
-   sign-in (Cognito) should succeed against the new origin.
-
-## Side note: the slice/07-followups branch
-
-Has uncommitted work — Cadence card moved from Targets to Follow-ups
-page (FollowUps.tsx) plus a Targets.tsx revert. Independent of the DNS
-work; commit whenever you're ready.
+1. `dig NS <new-domain> @8.8.8.8 +short` → expect AWS NS records.
+2. Edit `infra/dns/template.yaml` defaults (`HostedZoneId`,
+   `AppDomain`).
+3. `make delete-dns` then `make deploy-dns`.
+4. `make wire-frontend && make sync-frontend`.
