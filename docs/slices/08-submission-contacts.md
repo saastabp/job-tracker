@@ -1,6 +1,62 @@
-# Slice 08 — Submission ↔ contact linking (PLAN)
+# Slice 08 — Submission ↔ contact linking
 
-Status: planned, not started. Branch: `slice/08-submission-contacts` (TBD).
+Status: code complete, deploy pending. Branch: `08-submission-contacts`.
+
+## Where we left off (resumption notes)
+
+**Code state (uncommitted on top of `192ec3b Documentation updates to bring current`):**
+
+- `backend/src/migrations/0006_submission_contacts.sql` — junction
+  table with unique key on `(submission_id, contact_id)`, reverse
+  index on `contact_id`, ON DELETE CASCADE both sides.
+- `backend/src/handlers/submissions.py` — `_detail` returns
+  `contacts[]`; new `_replace_contacts` + route
+  `PUT /submissions/{id}/contacts`. Validates the submission belongs
+  to caller and every contact_id in the new set does too (rejects
+  the whole call on a mismatch — no silent drop, no leak).
+- `backend/src/handlers/contacts.py` — `_detail` returns
+  `linked_submissions[]` joined through the junction.
+- `backend/tests/unit/test_submissions.py` — 7 new tests covering
+  detail surfacing, set-replace diff (add / remove / clear-to-empty),
+  unowned-id 400, missing-submission 404, malformed body 400.
+- `backend/tests/unit/test_contacts.py` — `test_detail_with_outreach_timeline`
+  extended to assert `linked_submissions`. Five other tests touched
+  to add the extra fetchall for the new join. 133/133 unit tests pass.
+- `infra/api/template.yaml` — `ReplaceSubmissionContacts` event
+  registered on `SubmissionsFunction` for `PUT /submissions/{id}/contacts`.
+- `frontend/package.json` — `react-select ^5` added; user must
+  `npm install` once before next `npm run dev` / `npm run build`.
+- `frontend/src/pages/SubmissionDetail.tsx` — Contacts card with
+  `react-select` multi-select, dirty-aware Save button, links to
+  each linked contact.
+- `frontend/src/pages/ContactDetail.tsx` — Linked submissions table
+  below outreach history; row → `<Link to={`/submissions/${id}`}>`.
+
+**Next steps when resuming:**
+1. (Optional pre-flight) `cd frontend && npm install && npm run lint`
+   to pull react-select and confirm types compile. Skippable —
+   `sync-frontend` re-runs `npm install` + `npm run build` itself.
+2. `make deploy-api` — re-emits `SubmissionsFunction` with the new
+   route AND re-bundles the migrate Lambda's code package so it can
+   see `0006_submission_contacts.sql`.
+3. `make migrate` — applies `0006_submission_contacts.sql`.
+4. `make sync-frontend` — `npm install` + `npm run build` +
+   `aws s3 sync` to the SPA bucket + CloudFront `/*` invalidation
+   (waits for completion). The new Contacts card and Linked-submissions
+   table aren't visible until this lands.
+5. End-to-end test in the SPA: link a contact from a submission, check
+   the reverse appears on the contact detail page.
+6. If everything works, commit and merge to `develop`.
+
+**Watch out for:**
+- `react-select` adds ~30kB gzipped to the bundle. User accepted that
+  tradeoff for the polished UX vs. a checkbox list; see slice plan.
+- The set-replace API silently no-ops on a same-set PUT (added/removed
+  both empty → no INSERT, no DELETE, just a `_detail` re-fetch). That
+  is intentional — the SPA's Save button is gated on `contactsDirty`,
+  but a future caller could rely on the no-op behavior.
+
+## Plan (kept for reference)
 
 ## Why this slice next
 

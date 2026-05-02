@@ -330,6 +330,12 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /submissions/{id}
             Method: PUT
+        ReplaceSubmissionContacts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}/contacts
+            Method: PUT
 
   FollowUpsFunction:
     Type: AWS::Serverless::Function

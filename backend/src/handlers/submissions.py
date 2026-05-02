@@ -2,12 +2,14 @@
 
 Routes
 ------
-GET  /submissions          — list, filterable by status/company_id/from/to
-POST /submissions          — create; supports inline ``company_name`` create-or-find
-                             and inline ``jd_text`` + ``jd_url`` (text written to S3,
-                             jd_snapshots row inserted)
-GET  /submissions/{id}     — detail with company, jd_snapshot meta, follow_ups, responses
-PUT  /submissions/{id}     — update status/notes/role_title/resume_id/tailored_*
+GET  /submissions                   — list, filterable by status/company_id/from/to
+POST /submissions                   — create; supports inline ``company_name`` create-or-find
+                                      and inline ``jd_text`` + ``jd_url`` (text written to S3,
+                                      jd_snapshots row inserted)
+GET  /submissions/{id}              — detail with company, jd_snapshot meta, follow_ups,
+                                      responses, contacts
+PUT  /submissions/{id}              — update status/notes/role_title/resume_id/tailored_*
+PUT  /submissions/{id}/contacts     — replace the linked contact set (slice 08)
 
 JD snapshots
 ------------
@@ -469,6 +471,30 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
             for r in cur.fetchall()
         ]
 
+        cur.execute(
+            """
+            SELECT c.id, c.name, c.email, ck.short_name AS kind
+            FROM submission_contacts sc
+            JOIN contacts c
+                ON c.id = sc.contact_id
+                AND c.user_id = %s
+                AND c.deleted_at IS NULL
+            JOIN contact_kinds ck ON ck.id = c.contact_kind_id
+            WHERE sc.submission_id = %s
+            ORDER BY c.name
+            """,
+            (user_id, submission_id),
+        )
+        contacts = [
+            {
+                "id": int(r["id"]),
+                "name": r["name"],
+                "email": r["email"],
+                "kind": r["kind"],
+            }
+            for r in cur.fetchall()
+        ]
+
     detail = _row_to_summary(row)
     detail["resume_id"] = int(row["resume_id"]) if row["resume_id"] is not None else None
     detail["resume_title"] = row.get("resume_title")
@@ -485,6 +511,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
     detail["jd_text"] = _read_jd_text(jd_row["s3_key"]) if jd_row else None
     detail["follow_ups"] = follow_ups
     detail["responses"] = responses
+    detail["contacts"] = contacts
     return detail
 
 
@@ -621,6 +648,96 @@ def _update_jd(
         )
 
 
+def _verify_submission(conn: Any, user_id: int, submission_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM submissions "
+            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (submission_id, user_id),
+        )
+        if not cur.fetchone():
+            raise LookupError("submission not found")
+
+
+def _replace_contacts(
+    conn: Any, user_id: int, submission_id: int, body: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace the full set of contacts linked to a submission.
+
+    Body shape: ``{"contact_ids": [3, 7, 12]}``. Per slice-08 fork 1 the API
+    is set-based (full replacement) rather than pair-based; one round-trip
+    per save matches the SPA form.
+
+    Validates the submission belongs to the caller and that every contact
+    id in the new set does too — mixing in another user's contact would
+    leak its existence via the join, so we reject the whole call rather
+    than silently dropping unknowns.
+    """
+    raw = body.get("contact_ids")
+    if not isinstance(raw, list):
+        raise ValueError("contact_ids must be an array")
+    try:
+        new_ids = {int(v) for v in raw}
+    except (TypeError, ValueError):
+        raise ValueError("contact_ids must contain integers")
+
+    _verify_submission(conn, user_id, submission_id)
+
+    if new_ids:
+        placeholders = ", ".join(["%s"] * len(new_ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id FROM contacts "
+                f"WHERE user_id = %s AND deleted_at IS NULL "
+                f"AND id IN ({placeholders})",
+                (user_id, *new_ids),
+            )
+            owned = {int(r["id"]) for r in cur.fetchall()}
+        missing = new_ids - owned
+        if missing:
+            raise ValueError(f"contact_ids not found: {sorted(missing)}")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT contact_id FROM submission_contacts WHERE submission_id = %s",
+            (submission_id,),
+        )
+        existing = {int(r["contact_id"]) for r in cur.fetchall()}
+
+    to_add = new_ids - existing
+    to_remove = existing - new_ids
+
+    logger.info(
+        "submissions.contacts: replacing",
+        extra={
+            "user_id": user_id,
+            "submission_id": submission_id,
+            "added": sorted(to_add),
+            "removed": sorted(to_remove),
+        },
+    )
+
+    if to_remove:
+        placeholders = ", ".join(["%s"] * len(to_remove))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM submission_contacts "
+                f"WHERE submission_id = %s AND contact_id IN ({placeholders})",
+                (submission_id, *to_remove),
+            )
+
+    if to_add:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO submission_contacts (submission_id, contact_id) "
+                "VALUES (%s, %s)",
+                [(submission_id, cid) for cid in to_add],
+            )
+
+    conn.commit()
+    return _detail(conn, user_id, submission_id)
+
+
 @logger.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     sub = user_sub(event)
@@ -640,6 +757,9 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             elif route_key == "PUT /submissions/{id}":
                 body = json.loads(event.get("body") or "{}")
                 result = _update(conn, user_id, sub, _path_id(event), body)
+            elif route_key == "PUT /submissions/{id}/contacts":
+                body = json.loads(event.get("body") or "{}")
+                result = _replace_contacts(conn, user_id, _path_id(event), body)
             else:
                 logger.warning("submissions: unknown route", extra={"route_key": route_key})
                 return _response(404, {"error": f"no handler for {route_key}"})

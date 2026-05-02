@@ -13,6 +13,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../api/client';
 import { KindBadge } from './Contacts';
 import { KINDS, METHODS, DIRECTIONS } from './ContactForm';
+import { StatusBadge } from './Submissions';
 
 interface OutreachEvent {
   id: number;
@@ -20,6 +21,13 @@ interface OutreachEvent {
   method: string | null;
   direction: string;
   notes: string | null;
+}
+
+interface LinkedSubmission {
+  id: number;
+  role_title: string | null;
+  company_name: string | null;
+  status: string;
 }
 
 interface ContactDetailData {
@@ -36,6 +44,7 @@ interface ContactDetailData {
   outreach_count: number;
   last_outreach_at: string | null;
   outreach: OutreachEvent[];
+  linked_submissions: LinkedSubmission[];
 }
 
 interface CompanyOption {
@@ -408,6 +417,43 @@ export default function ContactDetail() {
                   >
                     Delete
                   </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      <h5 className="mt-4">
+        Linked submissions ({data.linked_submissions.length})
+      </h5>
+      {data.linked_submissions.length === 0 ? (
+        <Card>
+          <Card.Body className="text-muted">
+            No submissions linked to this contact yet — add them from the
+            submission detail page.
+          </Card.Body>
+        </Card>
+      ) : (
+        <Table hover responsive className="align-middle">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Company</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.linked_submissions.map((s) => (
+              <tr key={s.id}>
+                <td>
+                  <Link to={`/submissions/${s.id}`}>
+                    {s.role_title || 'Untitled role'}
+                  </Link>
+                </td>
+                <td>{s.company_name ?? '—'}</td>
+                <td>
+                  <StatusBadge status={s.status} />
                 </td>
               </tr>
             ))}

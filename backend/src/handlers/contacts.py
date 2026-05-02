@@ -4,7 +4,7 @@ Routes
 ------
 GET    /contacts                                  — list (filter ``?kind=``, ``?company_id=``)
 POST   /contacts                                  — create
-GET    /contacts/{id}                             — detail + outreach timeline
+GET    /contacts/{id}                             — detail + outreach timeline + linked submissions
 PUT    /contacts/{id}                             — update mutable fields
 DELETE /contacts/{id}                             — soft-delete
 POST   /contacts/{id}/outreach                    — log an outreach event
@@ -232,8 +232,38 @@ def _detail(conn: Any, user_id: int, contact_id: int) -> dict[str, Any]:
             for r in cur.fetchall()
         ]
 
+        cur.execute(
+            """
+            SELECT
+                s.id, s.role_title,
+                co.name AS company_name,
+                ss.short_name AS status
+            FROM submission_contacts sc
+            JOIN submissions s
+                ON s.id = sc.submission_id
+                AND s.user_id = %s
+                AND s.deleted_at IS NULL
+            JOIN submission_statuses ss ON ss.id = s.submission_status_id
+            LEFT JOIN companies co
+                ON co.id = s.company_id AND co.deleted_at IS NULL
+            WHERE sc.contact_id = %s
+            ORDER BY s.submitted_on DESC, s.id DESC
+            """,
+            (user_id, contact_id),
+        )
+        linked_submissions = [
+            {
+                "id": int(r["id"]),
+                "role_title": r["role_title"],
+                "company_name": r["company_name"],
+                "status": r["status"],
+            }
+            for r in cur.fetchall()
+        ]
+
     detail = _row_to_contact(row)
     detail["outreach"] = outreach
+    detail["linked_submissions"] = linked_submissions
     return detail
 
 

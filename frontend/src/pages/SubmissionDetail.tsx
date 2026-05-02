@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Card,
   Form,
@@ -10,6 +10,7 @@ import {
   Collapse,
   Badge,
 } from 'react-bootstrap';
+import Select from 'react-select';
 import { Link, useParams } from 'react-router-dom';
 import { aiEnabled, useApi } from '../api/client';
 import { STATUSES } from './SubmissionForm';
@@ -39,6 +40,13 @@ interface ResponseRow {
   classification: string;
 }
 
+interface ContactSummary {
+  id: number;
+  name: string;
+  email: string | null;
+  kind: string;
+}
+
 interface SubmissionDetail {
   id: number;
   role_title: string | null;
@@ -56,6 +64,12 @@ interface SubmissionDetail {
   jd_text: string | null;
   follow_ups: FollowUp[];
   responses: ResponseRow[];
+  contacts: ContactSummary[];
+}
+
+interface ContactOption {
+  value: number;
+  label: string;
 }
 
 interface ResumeOption {
@@ -106,6 +120,9 @@ export default function SubmissionDetail() {
   const [tailorMessage, setTailorMessage] = useState<string | null>(null);
   const [followUpBusyId, setFollowUpBusyId] = useState<number | null>(null);
   const [addFollowUpBusy, setAddFollowUpBusy] = useState(false);
+  const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
+  const [selectedContactIds, setSelectedContactIds] = useState<number[]>([]);
+  const [savingContacts, setSavingContacts] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -119,6 +136,7 @@ export default function SubmissionDetail() {
       setEditSubmittedOn(d.submitted_on ?? '');
       setEditJdUrl(d.jd_url ?? '');
       setEditJdText(d.jd_text ?? '');
+      setSelectedContactIds(d.contacts.map((c) => c.id));
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -144,6 +162,65 @@ export default function SubmissionDetail() {
       )
       .catch(() => setResumes([]));
   }, [apiFetch]);
+
+  useEffect(() => {
+    apiFetch('/contacts')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) =>
+        setContactOptions(
+          rows.map((c: any) => ({
+            value: c.id,
+            label: c.company_name ? `${c.name} — ${c.company_name}` : c.name,
+          })),
+        ),
+      )
+      .catch(() => setContactOptions([]));
+  }, [apiFetch]);
+
+  const selectedContactOptions = useMemo(() => {
+    const idSet = new Set(selectedContactIds);
+    // Surface every selected id even if /contacts hasn't loaded yet (or the
+    // contact was created after this page mounted) — fall back to a label
+    // derived from data.contacts.
+    const fromOptions = contactOptions.filter((o) => idSet.has(o.value));
+    if (fromOptions.length === selectedContactIds.length) return fromOptions;
+    const known = new Set(fromOptions.map((o) => o.value));
+    const fallbacks: ContactOption[] = [];
+    for (const c of data?.contacts ?? []) {
+      if (idSet.has(c.id) && !known.has(c.id)) {
+        fallbacks.push({ value: c.id, label: c.name });
+      }
+    }
+    return [...fromOptions, ...fallbacks];
+  }, [contactOptions, selectedContactIds, data]);
+
+  const contactsDirty = useMemo(() => {
+    if (!data) return false;
+    const loaded = new Set(data.contacts.map((c) => c.id));
+    if (loaded.size !== selectedContactIds.length) return true;
+    for (const id of selectedContactIds) if (!loaded.has(id)) return true;
+    return false;
+  }, [data, selectedContactIds]);
+
+  async function saveContacts() {
+    if (!data) return;
+    setSavingContacts(true);
+    try {
+      const r = await apiFetch(`/submissions/${id}/contacts`, {
+        method: 'PUT',
+        body: JSON.stringify({ contact_ids: selectedContactIds }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const d: SubmissionDetail = await r.json();
+      setData(d);
+      setSelectedContactIds(d.contacts.map((c) => c.id));
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingContacts(false);
+    }
+  }
 
   async function handleTailor() {
     if (!data) return;
@@ -494,6 +571,42 @@ export default function SubmissionDetail() {
           </Card>
         </Col>
       </Row>
+
+      <Card className="mb-3">
+        <Card.Body>
+          <Card.Subtitle className="text-muted mb-2">Contacts</Card.Subtitle>
+          <Select
+            isMulti
+            options={contactOptions}
+            value={selectedContactOptions}
+            onChange={(next) =>
+              setSelectedContactIds(next.map((o) => o.value))
+            }
+            placeholder="Link contacts to this submission…"
+            classNamePrefix="rs"
+          />
+          <div className="mt-2">
+            <Button
+              size="sm"
+              onClick={saveContacts}
+              disabled={!contactsDirty || savingContacts}
+            >
+              {savingContacts ? 'Saving…' : 'Save contacts'}
+            </Button>
+            {data.contacts.length > 0 && (
+              <span className="ms-3 text-muted small">
+                {data.contacts.length} linked —{' '}
+                {data.contacts.map((c, i) => (
+                  <span key={c.id}>
+                    {i > 0 && ', '}
+                    <Link to={`/contacts/${c.id}`}>{c.name}</Link>
+                  </span>
+                ))}
+              </span>
+            )}
+          </div>
+        </Card.Body>
+      </Card>
 
       <Card className="mb-3">
         <Card.Body>

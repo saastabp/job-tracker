@@ -102,7 +102,7 @@ def test_create_contact(mocker, patched_conn, mock_cursor, auth_event, lambda_ct
     #   1. _catalog_id(contact_kinds 'personal') → {"id": 1}
     #   2. _detail SELECT contact                → detail_row
     mock_cursor.fetchone.side_effect = [{"id": 1}, detail_row]
-    mock_cursor.fetchall.side_effect = [[]]  # _detail outreach timeline
+    mock_cursor.fetchall.side_effect = [[], []]  # outreach, linked_submissions
     mock_cursor.lastrowid = 99
 
     resp = contacts.handler(
@@ -193,15 +193,23 @@ def test_detail_with_outreach_timeline(
         "kind": "personal", "primary_method": "email",
         "outreach_count": 2, "last_outreach_at": "2026-04-25 09:00:00",
     }
-    mock_cursor.fetchall.return_value = [
-        {
-            "id": 11, "outreach_at": "2026-04-25 09:00:00",
-            "method": "email", "direction": "outbound", "notes": "follow-up",
-        },
-        {
-            "id": 10, "outreach_at": "2026-04-20 14:30:00",
-            "method": "linkedin", "direction": "outbound", "notes": None,
-        },
+    mock_cursor.fetchall.side_effect = [
+        [
+            {
+                "id": 11, "outreach_at": "2026-04-25 09:00:00",
+                "method": "email", "direction": "outbound", "notes": "follow-up",
+            },
+            {
+                "id": 10, "outreach_at": "2026-04-20 14:30:00",
+                "method": "linkedin", "direction": "outbound", "notes": None,
+            },
+        ],
+        [
+            {
+                "id": 42, "role_title": "SRE",
+                "company_name": "Acme", "status": "applied",
+            },
+        ],
     ]
 
     resp = contacts.handler(
@@ -216,6 +224,9 @@ def test_detail_with_outreach_timeline(
     assert len(body["outreach"]) == 2
     assert body["outreach"][0]["method"] == "email"
     assert body["outreach"][0]["direction"] == "outbound"
+    assert body["linked_submissions"] == [
+        {"id": 42, "role_title": "SRE", "company_name": "Acme", "status": "applied"},
+    ]
 
 
 def test_detail_not_found_returns_404(
@@ -270,7 +281,7 @@ def test_update_each_mutable_field(
     #   2. _catalog_id outreach_methods 'phone'     → {"id": 3}
     #   3. _detail SELECT contact                   → detail_row
     mock_cursor.fetchone.side_effect = [{"id": 2}, {"id": 3}, detail_row]
-    mock_cursor.fetchall.side_effect = [[]]
+    mock_cursor.fetchall.side_effect = [[], []]
     mock_cursor.rowcount = 1
 
     resp = contacts.handler(
@@ -314,7 +325,7 @@ def test_update_clear_primary_method(
         "outreach_count": 0, "last_outreach_at": None,
     }
     mock_cursor.fetchone.side_effect = [detail_row]
-    mock_cursor.fetchall.side_effect = [[]]
+    mock_cursor.fetchall.side_effect = [[], []]
     mock_cursor.rowcount = 1
 
     resp = contacts.handler(
@@ -410,7 +421,7 @@ def test_log_outreach_with_method_and_direction(
     mock_cursor.fetchone.side_effect = [
         {"id": 1}, {"id": 2}, {"id": 1}, detail_row,
     ]
-    mock_cursor.fetchall.side_effect = [[]]
+    mock_cursor.fetchall.side_effect = [[], []]
 
     resp = contacts.handler(
         auth_event(
@@ -449,7 +460,7 @@ def test_log_outreach_uses_explicit_timestamp(
     }
     # Sequence: _verify_contact → _catalog_id direction 'outbound' → _detail
     mock_cursor.fetchone.side_effect = [{"id": 1}, {"id": 1}, detail_row]
-    mock_cursor.fetchall.side_effect = [[]]
+    mock_cursor.fetchall.side_effect = [[], []]
 
     resp = contacts.handler(
         auth_event(

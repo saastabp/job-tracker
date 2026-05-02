@@ -118,6 +118,7 @@ def test_create_submission_with_company_name_and_jd(
     mock_cursor.fetchall.side_effect = [
         [],  # follow_ups (none surfaced here in this fetchall stub)
         [],  # responses
+        [],  # linked contacts (slice 08)
     ]
     # lastrowid is read three times: company INSERT, submission INSERT, follow_ups INSERT.
     type(mock_cursor).lastrowid = mocker.PropertyMock(side_effect=[88, 99, 123])
@@ -244,7 +245,7 @@ def test_create_submission_honors_follow_up_days_zero(
         submission_row,               # _detail submission
         None,                         # _detail jd_snapshot
     ]
-    mock_cursor.fetchall.side_effect = [[], []]
+    mock_cursor.fetchall.side_effect = [[], [], []]
     type(mock_cursor).lastrowid = mocker.PropertyMock(side_effect=[99, 123])
 
     resp = submissions.handler(
@@ -468,6 +469,266 @@ def test_update_submission_empty_jd_text_clears_snapshot(
         "UPDATE jd_snapshots SET deleted_at = CURRENT_TIMESTAMP" in s
         for s in sql_calls
     )
+
+
+def test_detail_includes_linked_contacts(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """_detail surfaces the contacts array via the submission_contacts join."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [
+        submission_row,   # _detail submission
+        None,             # _detail jd_snapshot
+    ]
+    mock_cursor.fetchall.side_effect = [
+        [],  # follow_ups
+        [],  # responses
+        [    # contacts
+            {"id": 5, "name": "Alice", "email": "a@x.com", "kind": "personal"},
+            {"id": 6, "name": "Bob", "email": None, "kind": "recruiter"},
+        ],
+    ]
+
+    resp = submissions.handler(
+        auth_event("GET /submissions/{id}", path_id="99"),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert [c["name"] for c in body["contacts"]] == ["Alice", "Bob"]
+    assert body["contacts"][0]["kind"] == "personal"
+    assert body["contacts"][1]["email"] is None
+
+
+def test_replace_contacts_diffs_against_existing(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """PUT /submissions/{id}/contacts inserts new links and deletes dropped ones."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    # Sequence:
+    #   1. _verify_submission         → {"id": 99}
+    #   2. _detail submission row     → submission_row
+    #   3. _detail jd_snapshot        → None
+    mock_cursor.fetchone.side_effect = [{"id": 99}, submission_row, None]
+    # Sequence of fetchall:
+    #   1. ownership check on contact_ids        → all three present
+    #   2. existing links                         → [3, 7]
+    #   3. _detail follow_ups                     → []
+    #   4. _detail responses                      → []
+    #   5. _detail contacts                       → final state
+    mock_cursor.fetchall.side_effect = [
+        [{"id": 3}, {"id": 7}, {"id": 12}],          # ownership of new set
+        [{"contact_id": 3}, {"contact_id": 7}],      # existing links
+        [],                                           # follow_ups
+        [],                                           # responses
+        [                                             # final contacts
+            {"id": 3, "name": "Alice", "email": None, "kind": "personal"},
+            {"id": 7, "name": "Bob", "email": None, "kind": "recruiter"},
+            {"id": 12, "name": "Carol", "email": None, "kind": "personal"},
+        ],
+    ]
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="99",
+            body={"contact_ids": [3, 7, 12]},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    many_sql = [c.args[0] for c in mock_cursor.executemany.call_args_list]
+    # 3 was already linked, so no DELETE fires (existing == {3, 7}, new == {3, 7, 12}).
+    assert not any("DELETE FROM submission_contacts" in s for s in sql_calls)
+    # 12 is new → an INSERT runs (executemany batches the inserts).
+    assert any("INSERT INTO submission_contacts" in s for s in many_sql)
+    insert_rows = mock_cursor.executemany.call_args.args[1]
+    assert insert_rows == [(99, 12)]
+
+
+def test_replace_contacts_removes_dropped(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Dropping a contact from the set issues a DELETE and skips the INSERT."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [{"id": 99}, submission_row, None]
+    mock_cursor.fetchall.side_effect = [
+        [{"id": 3}],                                  # ownership of new set [3]
+        [{"contact_id": 3}, {"contact_id": 7}],      # existing links {3, 7}
+        [],                                           # follow_ups
+        [],                                           # responses
+        [{"id": 3, "name": "Alice", "email": None, "kind": "personal"}],
+    ]
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="99",
+            body={"contact_ids": [3]},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    many_sql = [c.args[0] for c in mock_cursor.executemany.call_args_list]
+    # 7 was dropped → a DELETE fires.
+    assert any("DELETE FROM submission_contacts" in s for s in sql_calls)
+    # No new contacts → no INSERT (executemany not invoked).
+    assert not any("INSERT INTO submission_contacts" in s for s in many_sql)
+
+
+def test_replace_contacts_clear_to_empty_set(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """``contact_ids: []`` sweeps every existing link."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    submission_row = {
+        "id": 99, "role_title": "SRE",
+        "submitted_on": "2026-04-28", "notes": None,
+        "company_id": None, "company_name": None,
+        "resume_id": None, "resume_title": None,
+        "status": "applied",
+        "tailored_title": None, "tailored_summary": None,
+        "jd_url": None,
+        "created_at": None, "updated_at": None,
+    }
+    mock_cursor.fetchone.side_effect = [{"id": 99}, submission_row, None]
+    # Empty set skips the ownership check (no IDs to verify), so the first
+    # fetchall is the existing-links lookup.
+    mock_cursor.fetchall.side_effect = [
+        [{"contact_id": 3}, {"contact_id": 7}],  # existing links
+        [], [], [],                                # follow_ups, responses, contacts
+    ]
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="99",
+            body={"contact_ids": []},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert any("DELETE FROM submission_contacts" in s for s in sql_calls)
+
+
+def test_replace_contacts_rejects_unowned_id_with_400(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Posting a contact_id that doesn't belong to the caller is a 400, not a silent drop."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    # _verify_submission succeeds; ownership check returns only {3}, so 99 is missing.
+    mock_cursor.fetchone.side_effect = [{"id": 77}]
+    mock_cursor.fetchall.side_effect = [[{"id": 3}]]
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="77",
+            body={"contact_ids": [3, 99]},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 400
+    assert "contact_ids not found" in json.loads(resp["body"])["error"]
+
+
+def test_replace_contacts_submission_not_found_returns_404(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    mock_cursor.fetchone.return_value = None  # _verify_submission miss
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="999",
+            body={"contact_ids": [1]},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 404
+
+
+def test_replace_contacts_non_array_returns_400(
+    mocker, patched_conn, auth_event, lambda_ctx,
+):
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+
+    resp = submissions.handler(
+        auth_event(
+            "PUT /submissions/{id}/contacts",
+            path_id="1",
+            body={"contact_ids": "not-an-array"},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 400
 
 
 def test_unknown_route_returns_404(mocker, patched_conn, auth_event, lambda_ctx):
