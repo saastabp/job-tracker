@@ -36,35 +36,21 @@ Picking linking for slice 08 because:
   per-link role later, it's a `submission_contact_roles` catalog
   table. Per `project_extensibility.md`.
 
-## Forks the user needs to decide before code starts
+## Forks (decided 2026-05-01)
 
-1. **API shape — set-semantics or pair-semantics?**
-   - *Set:* `PUT /submissions/{id}/contacts` with body `{contact_ids:
-     [3, 7, 12]}` replaces the full set. One round-trip per save.
-   - *Pair:* `POST /submissions/{id}/contacts/{contact_id}` to link,
-     `DELETE` to unlink. N round-trips, but trivially auditable.
-   - **Recommend Set.** Submission detail edits the link list as a
-     unit (just like resume_id is one PUT field); set-semantics matches
-     how the form will actually post.
+1. **API shape: Set.** `PUT /submissions/{id}/contacts` with body
+   `{contact_ids: [3, 7, 12]}` replaces the full set. One round-trip
+   per save; matches how the SPA form will post. Pair-semantics
+   (POST/DELETE per link) rejected.
 
-2. **List both directions or just one?**
-   - *Both:* `GET /submissions/{id}` already returns `contacts: [...]`
-     in the detail; also extend `GET /contacts/{id}` to return
-     `linked_submissions: [...]`.
-   - *Submission-side only:* show contacts on submission detail, but
-     contact detail keeps its current shape.
-   - **Recommend Both.** The reverse list is a single JOIN; no extra
-     round-trip and it makes the contact detail page meaningfully
-     more useful for outreach planning.
+2. **List both directions: Both.** `GET /submissions/{id}` adds
+   `contacts: [...]`; `GET /contacts/{id}` adds `linked_submissions:
+   [...]`. Reverse list is one JOIN, no extra round-trip, makes the
+   contact detail page useful for outreach planning.
 
-3. **Surface in the contacts list filter?**
-   - *Yes:* `GET /contacts?submission_id=99` returns only the
-     contacts linked to that submission (used to render an "already
-     linked" hint on the multiselect).
-   - *No:* the multiselect always loads all contacts; the SPA does
-     the diff.
-   - **Recommend No.** The contacts list is small (personal use); a
-     full pull is fine and avoids a special-case query.
+3. **`?submission_id=` filter on contacts list: No.** Personal-use
+   pool is small; SPA pulls full list and diffs locally. Avoids a
+   special-case query.
 
 ## Proposed schema
 

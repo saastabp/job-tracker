@@ -108,13 +108,21 @@ make -C infra fetch-rds-ca
 
 (Saves `backend/src/rds-ca-bundle.pem`. The Makefile re-runs this automatically as part of `deploy-api`, but running it now confirms internet access works.)
 
-### 3. Deploy all stacks
+### 3. Provision all stacks
 
 ```sh
 make -C infra deploy-all
 ```
 
-This deploys, in dependency order: `network` → `data` (RDS takes ~8 min on first create) → `auth` → `api` → `frontend` (CloudFront takes ~5 min). Total first deploy: 15–20 minutes.
+This deploys, in dependency order: `network` → `data` (RDS takes ~8 min on first create) → `auth` → `api` → `frontend` (CloudFront takes ~5 min) → `ai` → `wire-frontend`. Total first provision: 15–20 minutes.
+
+**`deploy-all` provisions the infrastructure but does not finish the bootstrap.** A working end-to-end app additionally requires:
+
+1. Creating the MySQL `app` user (one-time manual step — see below).
+2. Running schema migrations (`make migrate`).
+3. Building and publishing the SPA to S3 + CloudFront (`make sync-frontend`).
+
+The order is: `deploy-all` → `app` user bootstrap → `migrate` → `sync-frontend`. Each step is documented in the subsections below.
 
 ### 4. Inspect the resulting SSM parameters
 
@@ -157,6 +165,16 @@ FLUSH PRIVILEGES;
 
 Tighten the `app` grants once real tables exist. The IAM auth + TLS gate the public endpoint; nothing here exposes the master password to the internet.
 
+### Run schema migrations
+
+The `data` stack stands up an empty MySQL database. Schema is applied by the `MigrationFunction` Lambda, which runs every forward-only SQL file under `backend/src/migrations/` in order. Run it after the `app` user exists (the migration Lambda authenticates as `app`):
+
+```sh
+make -C infra migrate
+```
+
+Re-runnable: the migration runner records applied versions in a `schema_migrations` table and skips files it's already run. Run again after every `git pull` that introduces a new migration file, and after any `deploy-api` that ships migration changes.
+
 ### Cognito callbacks + API CORS for the deployed frontend
 
 `make deploy-auth` and `make deploy-api` auto-detect the CloudFront URL from SSM and pass it as a parameter override, so they keep the Cognito callback list and API CORS allow-list correct on every standalone re-deploy. On the first-ever `deploy-all` (when CloudFront doesn't yet exist), the final `wire-frontend` step re-runs auth + api once the URL is available.
@@ -185,11 +203,17 @@ make -C infra sync-frontend
 
 `gen-frontend-env` (used by both targets) writes only the four `VITE_*` values that don't depend on runtime URL. `VITE_REDIRECT_URL` is intentionally not set — `auth/config.ts` falls back to `window.location.origin`, so the same bundle works locally (`http://localhost:5173/`) and deployed (`https://...cloudfront.net/`).
 
+#### `AI_ENABLED` knob — temporarily disabling Bedrock features
+
+The Makefile defines `AI_ENABLED ?= 0`. While that's 0, `gen-frontend-env` omits `VITE_AI_API_URL` from `frontend/.env.local`; the SPA's `aiEnabled` flag is false, and the AI tailor / mine-resume buttons hide. This is the current state while the AWS support case for Bedrock service quotas is open.
+
+Once Bedrock is configured in the region, flip the default by changing `AI_ENABLED ?= 0` to `AI_ENABLED ?= 1` in `infra/Makefile`, then re-run `make sync-frontend`. (One-shot alternative: `AI_ENABLED=1 make -C infra sync-frontend`.) The AI SAM stack itself stays running unless you explicitly `make delete-ai` — the knob is purely a frontend concern.
+
 ## Operational safety — what's safe to re-run standalone
 
 | Operation | Safe alone? | Notes |
 |---|---|---|
-| `make deploy-all` | **Always** | Idempotent. The "put everything right" hammer. Always converges to a working state, including the `wire-frontend` final step. |
+| `make deploy-all` | **Always** | Idempotent. The "put everything right" hammer for **infrastructure** — converges every stack and runs `wire-frontend`. Does **not** create the MySQL `app` user, run `migrate`, or `sync-frontend`; those still need to follow on a fresh deploy (see Deploy section). |
 | `make deploy-network` | Mostly | SG/tag/route changes update in place. Changing the VPC CIDR or AZ count would force-replace subnets and cascade into RDS replacement (data loss). Don't change those properties without thinking twice. |
 | `make deploy-data` | Mostly | Most updates are in-place (instance class, storage growth). Some properties (engine major version, encryption-at-rest toggle) trigger replacement; `DeletionPolicy: Snapshot` is a backstop, not a substitute. |
 | `make deploy-auth` | **Yes** | Auto-detects CloudFront URL from SSM and preserves Cognito callback wiring on every run. |

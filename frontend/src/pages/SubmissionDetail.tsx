@@ -11,7 +11,7 @@ import {
   Badge,
 } from 'react-bootstrap';
 import { Link, useParams } from 'react-router-dom';
-import { useApi } from '../api/client';
+import { aiEnabled, useApi } from '../api/client';
 import { STATUSES } from './SubmissionForm';
 import { StatusBadge } from './Submissions';
 
@@ -463,14 +463,16 @@ export default function SubmissionDetail() {
               <hr />
               <Card.Subtitle className="text-muted mb-2">Actions</Card.Subtitle>
               <div className="d-flex gap-2 flex-wrap">
-                <Button
-                  variant="outline-primary"
-                  size="sm"
-                  onClick={handleTailor}
-                  disabled={tailorBusy}
-                >
-                  {tailorBusy ? 'Tailoring…' : 'Tailor with AI'}
-                </Button>
+                {aiEnabled && (
+                  <Button
+                    variant="outline-primary"
+                    size="sm"
+                    onClick={handleTailor}
+                    disabled={tailorBusy}
+                  >
+                    {tailorBusy ? 'Tailoring…' : 'Tailor with AI'}
+                  </Button>
+                )}
                 <Button
                   variant="outline-secondary"
                   size="sm"
@@ -480,6 +482,11 @@ export default function SubmissionDetail() {
                   {addFollowUpBusy ? 'Adding…' : 'Add follow-up'}
                 </Button>
               </div>
+              {!aiEnabled && (
+                <div className="text-muted small mt-2">
+                  AI tailoring temporarily disabled.
+                </div>
+              )}
               {tailorMessage && (
                 <div className="text-muted small mt-2">{tailorMessage}</div>
               )}

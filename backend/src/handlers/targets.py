@@ -1,27 +1,35 @@
-"""Targets endpoints — catalog + per-user goal counts.
+"""Targets endpoints — catalog + per-user goal counts + follow-up cadence.
 
 GET /targets
-    Returns the full target_types catalog joined with the caller's targets so
-    the UI can render the form even before any goals exist. Shape::
+    Returns the user-tunable target_types catalog joined with the caller's
+    targets, plus the caller's follow-up cadence. Shape::
 
         {
           "types": [
             {"id": 1, "short_name": "submissions", "description": "Submissions",
              "daily": 5, "weekly": 25},
             ...
-          ]
+          ],
+          "follow_up_days": 7
         }
 
     ``daily`` / ``weekly`` are integers when the user has set a goal, ``null``
-    otherwise.
+    otherwise. The ``follow_ups`` catalog row is excluded — follow-ups are
+    reactive (queued by prior submissions hitting their due date), not a
+    user-set daily/weekly goal.
 
 PUT /targets
-    Upserts the caller's goals. Body::
+    Upserts the caller's goals and (optionally) follow-up cadence. Body::
 
-        {"goals": [{"target_type_id": 1, "cadence": "daily", "goal_count": 5}, ...]}
+        {
+          "goals": [{"target_type_id": 1, "cadence": "daily", "goal_count": 5}, ...],
+          "follow_up_days": 7
+        }
 
-    Each entry is upserted on ``(user_id, target_type_id, cadence)``. Unspecified
-    rows are left alone (the UI sends only the rows it has values for).
+    Each goals entry is upserted on ``(user_id, target_type_id, cadence)``.
+    ``follow_up_days`` is optional; when present it updates ``users.follow_up_days``
+    and only affects **new** submissions — already-scheduled follow-ups keep
+    their original ``due_at``.
 """
 from __future__ import annotations
 
@@ -61,12 +69,18 @@ def _get(conn: Any, user_id: int) -> dict[str, Any]:
                 AND t.user_id = %s
                 AND t.deleted_at IS NULL
             WHERE tt.deleted_at IS NULL
+              AND tt.short_name <> 'follow_ups'
             GROUP BY tt.id, tt.short_name, tt.description
             ORDER BY tt.id
             """,
             (user_id,),
         )
         rows = cur.fetchall()
+        cur.execute(
+            "SELECT follow_up_days FROM users WHERE id = %s",
+            (user_id,),
+        )
+        user_row = cur.fetchone()
     types = [
         {
             "id": int(r["id"]),
@@ -77,15 +91,37 @@ def _get(conn: Any, user_id: int) -> dict[str, Any]:
         }
         for r in rows
     ]
-    logger.info("targets.get: returning", extra={"type_count": len(types)})
-    return {"types": types}
+    follow_up_days = int(user_row["follow_up_days"]) if user_row else 7
+    logger.info(
+        "targets.get: returning",
+        extra={"type_count": len(types), "follow_up_days": follow_up_days},
+    )
+    return {"types": types, "follow_up_days": follow_up_days}
 
 
 def _put(conn: Any, user_id: int, body: dict[str, Any]) -> dict[str, Any]:
     goals = body.get("goals", [])
     if not isinstance(goals, list):
         raise ValueError("body.goals must be a list")
-    logger.info("targets.put: upserting", extra={"user_id": user_id, "count": len(goals)})
+
+    follow_up_days_raw = body.get("follow_up_days")
+    follow_up_days: int | None = None
+    if follow_up_days_raw is not None:
+        try:
+            follow_up_days = int(follow_up_days_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError("follow_up_days must be a non-negative integer") from e
+        if follow_up_days < 0:
+            raise ValueError("follow_up_days must be a non-negative integer")
+
+    logger.info(
+        "targets.put: upserting",
+        extra={
+            "user_id": user_id,
+            "goal_count": len(goals),
+            "follow_up_days": follow_up_days,
+        },
+    )
 
     with conn.cursor() as cur:
         for entry in goals:
@@ -106,6 +142,11 @@ def _put(conn: Any, user_id: int, body: dict[str, Any]) -> dict[str, Any]:
                     deleted_at = NULL
                 """,
                 (user_id, target_type_id, cadence, goal_count),
+            )
+        if follow_up_days is not None:
+            cur.execute(
+                "UPDATE users SET follow_up_days = %s WHERE id = %s",
+                (follow_up_days, user_id),
             )
     conn.commit()
     logger.info("targets.put: committed", extra={"user_id": user_id})

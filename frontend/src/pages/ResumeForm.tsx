@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Modal, Form, Button, Alert, Row, Col, Badge } from 'react-bootstrap';
-import { useApi } from '../api/client';
+import { aiEnabled, useApi } from '../api/client';
 import PdfDropZone, { PDF_MAX_BYTES, formatFileSize } from '../components/PdfDropZone';
 
 interface Props {
@@ -44,6 +44,10 @@ export default function ResumeForm({ show, onHide, onCreated, suggestMaster }: P
   async function handleFileChange(f: File | null) {
     setFile(f);
     if (!f) return;
+    if (!aiEnabled) {
+      setAiHint('AI auto-fill is currently disabled — fill in title/summary manually.');
+      return;
+    }
     if (title.trim() || summary.trim()) {
       // Don't clobber what the user has already typed.
       setAiHint('PDF set. Title/summary already filled — AI auto-prefill skipped.');

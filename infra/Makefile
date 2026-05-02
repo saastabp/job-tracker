@@ -7,6 +7,12 @@
 REGION := us-west-2
 ROOT := $(shell git rev-parse --show-toplevel)
 
+# AI features in the SPA require Bedrock service quotas in this region.
+# Default 0 while the AWS support case is open. When quotas land, change
+# this to 1 (or pass `AI_ENABLED=1` on the command line) and re-run
+# `make sync-frontend` to publish a build that wires VITE_AI_API_URL.
+AI_ENABLED ?= 0
+
 help:
 	@echo "Targets:"
 	@echo "  check-prereqs     Verify aws CLI, SAM, node, python, etc."
@@ -151,12 +157,16 @@ gen-frontend-env:
 		--query Parameter.Value --output text --region $(REGION)) && \
 	COGNITO_DOMAIN=$$(aws ssm get-parameter --name /jobtracker/auth/cognito-domain \
 		--query Parameter.Value --output text --region $(REGION)) && \
-	AI_URL=$$(aws ssm get-parameter --name /jobtracker/ai/url \
-		--query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
-	printf 'VITE_API_URL=%s\nVITE_COGNITO_AUTHORITY=%s\nVITE_COGNITO_CLIENT_ID=%s\nVITE_COGNITO_DOMAIN=%s\nVITE_AI_API_URL=%s\n' \
-		"$$API_URL" "$$AUTHORITY" "$$CLIENT_ID" "$$COGNITO_DOMAIN" "$$AI_URL" \
-		> $(ROOT)/frontend/.env.local && \
-	echo "Wrote $(ROOT)/frontend/.env.local"
+	{ \
+		printf 'VITE_API_URL=%s\nVITE_COGNITO_AUTHORITY=%s\nVITE_COGNITO_CLIENT_ID=%s\nVITE_COGNITO_DOMAIN=%s\n' \
+			"$$API_URL" "$$AUTHORITY" "$$CLIENT_ID" "$$COGNITO_DOMAIN"; \
+		if [ "$(AI_ENABLED)" = "1" ]; then \
+			AI_URL=$$(aws ssm get-parameter --name /jobtracker/ai/url \
+				--query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+			printf 'VITE_AI_API_URL=%s\n' "$$AI_URL"; \
+		fi; \
+	} > $(ROOT)/frontend/.env.local && \
+	echo "Wrote $(ROOT)/frontend/.env.local (AI_ENABLED=$(AI_ENABLED))"
 
 dev-frontend: gen-frontend-env
 	cd $(ROOT)/frontend && npm install && npm run dev

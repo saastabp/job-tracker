@@ -4,6 +4,8 @@ import { useAuth } from 'react-oidc-context';
 const API_URL = import.meta.env.VITE_API_URL;
 const AI_API_URL = import.meta.env.VITE_AI_API_URL;
 
+export const aiEnabled = Boolean(AI_API_URL);
+
 /**
  * Routes a request to the right HttpApi base. Paths under ``/ai/`` go to the
  * AI stack's URL (which lives in its own tearable-down SAM stack and is
