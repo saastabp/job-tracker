@@ -1,6 +1,6 @@
 .PHONY: help check-prereqs fetch-rds-ca \
-        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-all \
-        wire-frontend migrate delete-ai delete-scheduler db-creds \
+        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-dns deploy-all \
+        wire-frontend migrate delete-ai delete-scheduler delete-dns db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
 
@@ -26,6 +26,8 @@ help:
 	@echo "  delete-ai         Tear down the AI stack"
 	@echo "  deploy-scheduler  Deploy scheduler stack (EventBridge Scheduler + follow-up notify Lambda + SES verified identity)"
 	@echo "  delete-scheduler  Tear down the scheduler stack (follow_ups rows persist; reminders stop firing)"
+	@echo "  deploy-dns        Deploy dns stack in us-east-1 (ACM cert + Route 53 alias) and re-deploy frontend with the alias attached"
+	@echo "  delete-dns        Tear down the dns stack (cert + alias records); SPA falls back to its cloudfront.net domain after deploy-frontend"
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
 	@echo "  wire-frontend     Re-deploy auth + api + ai with the CloudFront URL added to callbacks/CORS"
 	@echo "  migrate           Invoke the MigrationRunner Lambda (applies pending backend/migrations/*.sql)"
@@ -59,9 +61,14 @@ deploy-data: deploy-network
 # fixes this once the frontend stack creates the URL.
 deploy-auth:
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	APP_URL=$$(aws ssm get-parameter --name /jobtracker/dns/app-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	PCF_ARN=$$(aws ssm get-parameter --name /jobtracker/api/post-confirmation-function-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	ARGS=""; \
-	if [ -n "$$CF_URL" ]; then ARGS="$$ARGS CallbackUrls=http://localhost:5173/,$$CF_URL/ LogoutUrls=http://localhost:5173/,$$CF_URL/"; fi; \
+	if [ -n "$$CF_URL" ]; then \
+		URLS="http://localhost:5173/,$$CF_URL/"; \
+		if [ -n "$$APP_URL" ]; then URLS="$$URLS,$$APP_URL/"; fi; \
+		ARGS="$$ARGS CallbackUrls=$$URLS LogoutUrls=$$URLS"; \
+	fi; \
 	if [ -n "$$PCF_ARN" ]; then ARGS="$$ARGS PostConfirmationFunctionArn=$$PCF_ARN"; fi; \
 	if [ -n "$$ARGS" ]; then \
 		cd $(ROOT)/infra/auth && sam deploy --parameter-overrides $$ARGS; \
@@ -71,11 +78,16 @@ deploy-auth:
 
 deploy-api: deploy-network deploy-data deploy-auth fetch-rds-ca
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	APP_URL=$$(aws ssm get-parameter --name /jobtracker/dns/app-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	SCHED_GROUP=$$(aws ssm get-parameter --name /jobtracker/scheduler/group-name --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	SCHED_TARGET=$$(aws ssm get-parameter --name /jobtracker/scheduler/notify-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	SCHED_ROLE=$$(aws ssm get-parameter --name /jobtracker/scheduler/exec-role-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	ARGS=""; \
-	if [ -n "$$CF_URL" ]; then ARGS="$$ARGS CorsOrigins=http://localhost:5173,$$CF_URL"; fi; \
+	if [ -n "$$CF_URL" ]; then \
+		ORIGINS="http://localhost:5173,$$CF_URL"; \
+		if [ -n "$$APP_URL" ]; then ORIGINS="$$ORIGINS,$$APP_URL"; fi; \
+		ARGS="$$ARGS CorsOrigins=$$ORIGINS"; \
+	fi; \
 	if [ -n "$$SCHED_GROUP" ]; then ARGS="$$ARGS SchedulerGroupName=$$SCHED_GROUP SchedulerNotifyArn=$$SCHED_TARGET SchedulerRoleArn=$$SCHED_ROLE"; fi; \
 	if [ -n "$$ARGS" ]; then \
 		cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides $$ARGS; \
@@ -84,15 +96,57 @@ deploy-api: deploy-network deploy-data deploy-auth fetch-rds-ca
 	fi
 
 deploy-frontend:
-	cd $(ROOT)/infra/frontend && sam deploy
+	@CERT_ARN=$$(aws ssm get-parameter --name /jobtracker/dns/cert-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	APP_URL=$$(aws ssm get-parameter --name /jobtracker/dns/app-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	APP_DOMAIN=$$(echo "$$APP_URL" | sed 's|^https://||'); \
+	if [ -n "$$CERT_ARN" ] && [ -n "$$APP_DOMAIN" ]; then \
+		cd $(ROOT)/infra/frontend && sam deploy --parameter-overrides "AppDomain=$$APP_DOMAIN CertificateArn=$$CERT_ARN"; \
+	else \
+		cd $(ROOT)/infra/frontend && sam deploy; \
+	fi
+
+# DNS stack lives in us-east-1 because CloudFront requires its viewer
+# certificate to be issued there. The hosted zone (Route 53) is global, so
+# the alias records are also created from this stack. Per stack-segregation
+# rule, this stack owns ONLY the cert + alias records — nothing else
+# depends on it for data. Tearing it down drops the SPA back to its
+# cloudfront.net domain after a follow-up deploy-frontend.
+#
+# Standalone idempotency: deploy-dns re-runs deploy-frontend at the end so
+# the alias is actually attached to CloudFront in one shot. Without that,
+# the new A/AAAA records would resolve to a CloudFront distribution that
+# rejects requests for the custom hostname (TLS handshake works against
+# the default cert, but CloudFront returns 403/SSL_ERROR_HANDSHAKE_FAILURE
+# for the alias until ViewerCertificate is updated).
+deploy-dns: deploy-frontend
+	@CF_DOMAIN=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-domain --query Parameter.Value --output text --region $(REGION)) && \
+	[ -n "$$CF_DOMAIN" ] || { echo "error: /jobtracker/frontend/cloudfront-domain not in SSM (deploy-frontend first)" >&2; exit 1; } && \
+	echo "Deploying dns stack in us-east-1 (cert validation typically takes 5-30 min)..." && \
+	cd $(ROOT)/infra/dns && sam deploy --parameter-overrides "CloudFrontDomainName=$$CF_DOMAIN" && \
+	CERT_ARN=$$(aws cloudformation describe-stacks --stack-name jobtracker-dns --region us-east-1 \
+		--query 'Stacks[0].Outputs[?OutputKey==`CertificateArn`].OutputValue' --output text) && \
+	APP_URL=$$(aws cloudformation describe-stacks --stack-name jobtracker-dns --region us-east-1 \
+		--query 'Stacks[0].Outputs[?OutputKey==`AppUrl`].OutputValue' --output text) && \
+	aws ssm put-parameter --name /jobtracker/dns/cert-arn --type String --value "$$CERT_ARN" --overwrite --region $(REGION) >/dev/null && \
+	aws ssm put-parameter --name /jobtracker/dns/app-url --type String --value "$$APP_URL" --overwrite --region $(REGION) >/dev/null && \
+	echo "DNS stack deployed; re-running deploy-frontend to attach the alias..." && \
+	$(MAKE) deploy-frontend
+
+delete-dns:
+	cd $(ROOT)/infra/dns && sam delete --no-prompts --region us-east-1
+	@aws ssm delete-parameter --name /jobtracker/dns/cert-arn --region $(REGION) 2>/dev/null || true
+	@aws ssm delete-parameter --name /jobtracker/dns/app-url --region $(REGION) 2>/dev/null || true
 
 # AI stack runs OUTSIDE the VPC and only depends on auth (for the JWT
 # authorizer's user-pool params via SSM). Deployed independently of api/data
 # so it can be torn down without touching either.
 deploy-ai: deploy-auth
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	APP_URL=$$(aws ssm get-parameter --name /jobtracker/dns/app-url --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	if [ -n "$$CF_URL" ]; then \
-		cd $(ROOT)/infra/ai && sam build && sam deploy --parameter-overrides "CorsOrigins=http://localhost:5173,$$CF_URL"; \
+		ORIGINS="http://localhost:5173,$$CF_URL"; \
+		if [ -n "$$APP_URL" ]; then ORIGINS="$$ORIGINS,$$APP_URL"; fi; \
+		cd $(ROOT)/infra/ai && sam build && sam deploy --parameter-overrides "CorsOrigins=$$ORIGINS"; \
 	else \
 		cd $(ROOT)/infra/ai && sam build && sam deploy; \
 	fi
@@ -115,27 +169,41 @@ delete-scheduler:
 	@aws ssm delete-parameter --name /jobtracker/scheduler/notify-arn --region $(REGION) 2>/dev/null || true
 	@aws ssm delete-parameter --name /jobtracker/scheduler/exec-role-arn --region $(REGION) 2>/dev/null || true
 
+# deploy-dns is intentionally not in deploy-all's dependency chain — it's a
+# manual upgrade step (custom domain is opt-in, ACM validation is slow).
+# Run `make deploy-dns` separately after deploy-all if you want the alias.
 deploy-all: deploy-network deploy-data deploy-auth deploy-scheduler deploy-api deploy-frontend deploy-ai wire-frontend
 	@echo
 	@echo "All stacks deployed and CloudFront URL wired into auth + api + ai."
 	@echo "Next: one-time bootstrap of the MySQL 'app' user (see README), and"
 	@echo "  click the SES verification email sent to the SenderEmail address."
+	@echo "  For a custom domain (e.g. jobs.crazylittledog.link), run 'make deploy-dns'."
 
 wire-frontend:
 	@CF_URL=$$(aws ssm get-parameter --name /jobtracker/frontend/cloudfront-url \
 		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
 	[ -n "$$CF_URL" ] || { echo "error: /jobtracker/frontend/cloudfront-url not in SSM (deploy-frontend first)" >&2; exit 1; } && \
+	APP_URL=$$(aws ssm get-parameter --name /jobtracker/dns/app-url \
+		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
 	PCF_ARN=$$(aws ssm get-parameter --name /jobtracker/api/post-confirmation-function-arn \
 		--query Parameter.Value --output text --region $(REGION) 2>/dev/null) && \
-	echo "Wiring CloudFront URL into auth + api + ai: $$CF_URL" && \
-	AUTH_ARGS="CallbackUrls=http://localhost:5173/,$$CF_URL/ LogoutUrls=http://localhost:5173/,$$CF_URL/"; \
+	if [ -n "$$APP_URL" ]; then \
+		echo "Wiring CloudFront + custom domain into auth + api + ai: $$CF_URL, $$APP_URL"; \
+		CB="http://localhost:5173/,$$CF_URL/,$$APP_URL/"; \
+		ORIGINS="http://localhost:5173,$$CF_URL,$$APP_URL"; \
+	else \
+		echo "Wiring CloudFront URL into auth + api + ai: $$CF_URL"; \
+		CB="http://localhost:5173/,$$CF_URL/"; \
+		ORIGINS="http://localhost:5173,$$CF_URL"; \
+	fi; \
+	AUTH_ARGS="CallbackUrls=$$CB LogoutUrls=$$CB"; \
 	if [ -n "$$PCF_ARN" ]; then AUTH_ARGS="$$AUTH_ARGS PostConfirmationFunctionArn=$$PCF_ARN"; fi; \
 	cd $(ROOT)/infra/auth && sam deploy --parameter-overrides $$AUTH_ARGS && \
 	cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides \
-		"CorsOrigins=http://localhost:5173,$$CF_URL" && \
+		"CorsOrigins=$$ORIGINS" && \
 	if aws cloudformation describe-stacks --stack-name jobtracker-ai --region $(REGION) >/dev/null 2>&1; then \
 		cd $(ROOT)/infra/ai && sam build && sam deploy --parameter-overrides \
-			"CorsOrigins=http://localhost:5173,$$CF_URL"; \
+			"CorsOrigins=$$ORIGINS"; \
 	fi
 
 migrate:

@@ -1,6 +1,21 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Job Tracker - Frontend stack (private S3 SPA bucket + CloudFront with OAC)
 
+Parameters:
+  AppDomain:
+    Type: String
+    Default: ''
+    Description: Custom domain to attach as a CloudFront alias (e.g. jobs.crazylittledog.link). Supplied by the Makefile from /jobtracker/dns/app-url after the dns stack deploys; empty on first deploy so the distribution comes up on its default cloudfront.net domain.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN (must be in us-east-1) covering AppDomain. Supplied by the Makefile from /jobtracker/dns/cert-arn. Empty when AppDomain is empty.
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref AppDomain, '']]
+    - !Not [!Equals [!Ref CertificateArn, '']]
+
 Resources:
 
   SpaBucket:
@@ -40,6 +55,16 @@ Resources:
         HttpVersion: http2and3
         IPV6Enabled: true
         PriceClass: PriceClass_100
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref AppDomain]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - !Ref AWS::NoValue
         Origins:
           - Id: SpaOrigin
             DomainName: !GetAtt SpaBucket.RegionalDomainName
