@@ -169,9 +169,6 @@ export default function ResumeDetail() {
                   value={editSummary}
                   onChange={(e) => setEditSummary(e.target.value)}
                 />
-                <Form.Text className="text-muted">
-                  Voice/style exemplar for AI-tailored summaries (slice 06).
-                </Form.Text>
               </Form.Group>
               <div className="mt-3">
                 <Button

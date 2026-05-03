@@ -11,7 +11,7 @@ ROOT := $(shell git rev-parse --show-toplevel)
 # Default 0 while the AWS support case is open. When quotas land, change
 # this to 1 (or pass `AI_ENABLED=1` on the command line) and re-run
 # `make sync-frontend` to publish a build that wires VITE_AI_API_URL.
-AI_ENABLED ?= 0
+AI_ENABLED ?= 1
 
 help:
 	@echo "Targets:"
