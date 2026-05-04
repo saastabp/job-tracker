@@ -11,6 +11,7 @@ const NAV_ITEMS: { to: string; label: string }[] = [
   { to: '/contacts', label: 'Contacts' },
   { to: '/follow-ups', label: 'Follow-ups' },
   { to: '/targets', label: 'Targets' },
+  { to: '/settings', label: 'Settings' },
 ];
 
 export default function AppShell() {

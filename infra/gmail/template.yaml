@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Job Tracker - gmail stack (KMS key for refresh-token encryption + S3 archive bucket + EventBridge-scheduled poller Lambda)
+
+# This stack owns the Gmail integration's stateful infrastructure: a KMS key
+# used to encrypt OAuth refresh tokens stored in `gmail_credentials`, and an
+# S3 bucket where the poller archives raw RFC 822 message bytes. Per
+# stack-segregation rule (feedback_stacks), it can be torn down without
+# disturbing data: existing gmail_credentials rows persist (the ciphertext
+# becomes undecryptable, which is the right safety story — a fresh OAuth
+# re-consent is required to reconnect).
+#
+# Phase A (this commit): KMS key + archive bucket + SSM outputs only. No
+# Lambda functions yet — those land in subsequent phases that add the
+# OAuth, admin, poller, and compose handlers.
+#
+# OAuth client id/secret are NOT created by this template. AWS::SSM::Parameter
+# only supports Type: String/StringList, not SecureString. The user creates
+# the SecureString manually post-deploy via:
+#
+#   aws ssm put-parameter \
+#     --name /jobtracker/gmail/oauth-client \
+#     --type SecureString \
+#     --value '{"client_id":"...","client_secret":"..."}' \
+#     --region us-west-2
+#
+# See infra/gmail/GCP-SETUP.md for the full walkthrough.
+
+Parameters:
+  DbEndpoint:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-endpoint
+  DbPort:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-port
+  DbName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-name
+  DbResourceId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /jobtracker/data/db-resource-id
+  DbUser:
+    Type: String
+    Default: app
+    Description: MySQL user the poller authenticates as via RDS IAM. Same user the api stack uses.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 512
+    Tracing: Disabled
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+
+  # KMS key used by the OAuth callback Lambda (encrypt) and the poller +
+  # compose Lambdas (decrypt). Symmetric key, single-region. Key policy is
+  # scoped to the AWS account root (admin) plus whatever Lambda execution
+  # roles the later-phase templates create — those role ARNs aren't known
+  # yet, so the policy starts permissive within the account and tightens
+  # via Phase B+ template updates.
+  GmailRefreshTokenKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encrypts Gmail OAuth refresh tokens stored in gmail_credentials.refresh_token_ciphertext
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      EnableKeyRotation: true
+
+  GmailRefreshTokenKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/jobtracker-gmail-refresh-token
+      TargetKeyId: !Ref GmailRefreshTokenKey
+
+  # S3 bucket where the inbound poller archives raw RFC 822 message bytes
+  # (one object per gmail message). Keyed by `<user_id>/<gmail_message_id>.eml`.
+  # `responses.raw_email_s3_key` points here.
+  #
+  # 180-day lifecycle expiration: enough to re-run classification later if the
+  # heuristic is improved, not enough to accumulate unbounded storage cost.
+  # Bucket is private (no public-access block override needed; the default
+  # account-level block applies). SSE-S3 default encryption — this bucket
+  # holds recruiter mail bodies, not refresh tokens, so KMS-grade encryption
+  # is overkill.
+  GmailArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'jobtracker-gmail-archive-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter180Days
+            Status: Enabled
+            ExpirationInDays: 180
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SSM parameters consumed by the api stack (in later phases) and by the
+  # gmail-stack Lambdas themselves once they land. Empty defaults in
+  # consumer templates mean: gmail stack absent → handlers no-op silently
+  # (matches the pattern used by scheduler/ai stacks per feedback_stacks).
+  SsmGmailKmsKeyId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/gmail/kms-key-id
+      Type: String
+      Value: !Ref GmailRefreshTokenKey
+
+  SsmGmailKmsKeyArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/gmail/kms-key-arn
+      Type: String
+      Value: !GetAtt GmailRefreshTokenKey.Arn
+
+  SsmGmailArchiveBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /jobtracker/gmail/archive-bucket
+      Type: String
+      Value: !Ref GmailArchiveBucket
+
+  # Poller Lambda — fetches new responses for each user's linked threads
+  # every 10 minutes. Invoked by EventBridge; no API Gateway exposure.
+  #
+  # No ReservedConcurrentExecutions — the AWS account's unreserved-pool
+  # minimum of 10 made the previous setting (1) reject the function
+  # entirely on accounts at the floor of the concurrency limit. Overlap
+  # safety comes from `INSERT IGNORE` on `responses.gmail_message_id`
+  # (unique key dedupes any same-message double-insert) plus the
+  # observation that a 10-minute cadence rarely overlaps a poll that
+  # typically completes in seconds. If two invocations ever do run
+  # simultaneously they process the same threads idempotently.
+  GmailPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-gmail-poller
+      CodeUri: ../../backend/src
+      Handler: handlers.gmail_poller.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          GMAIL_KMS_KEY_ID: !Ref GmailRefreshTokenKey
+          GMAIL_OAUTH_CLIENT_SSM_PATH: '/jobtracker/gmail/oauth-client'
+          GMAIL_ARCHIVE_BUCKET: !Ref GmailArchiveBucket
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt GmailRefreshTokenKey.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobtracker/gmail/oauth-client'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${GmailArchiveBucket.Arn}/*'
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            Name: jobtracker-gmail-poll
+            Description: Polls each connected user's linked Gmail threads every 10 minutes
+            ScheduleExpression: rate(10 minutes)
+            FlexibleTimeWindow:
+              Mode: 'OFF'
+
+Outputs:
+  GmailKmsKeyId:
+    Value: !Ref GmailRefreshTokenKey
+  GmailKmsKeyArn:
+    Value: !GetAtt GmailRefreshTokenKey.Arn
+  GmailKmsKeyAlias:
+    Value: !Ref GmailRefreshTokenKeyAlias
+  GmailArchiveBucketName:
+    Value: !Ref GmailArchiveBucket
+  GmailArchiveBucketArn:
+    Value: !GetAtt GmailArchiveBucket.Arn
+  GmailPollerFunctionArn:
+    Value: !GetAtt GmailPollerFunction.Arn

@@ -13,6 +13,8 @@ import {
 import Select from 'react-select';
 import { Link, useParams } from 'react-router-dom';
 import { aiEnabled, useApi } from '../api/client';
+import { hasSendScope, useGmailStatus } from '../api/gmail';
+import GmailComposeModal from '../components/GmailComposeModal';
 import { STATUSES } from './SubmissionForm';
 import { StatusBadge } from './Submissions';
 
@@ -37,6 +39,8 @@ interface ResponseRow {
   received_at: string | null;
   from_email: string | null;
   subject: string | null;
+  body_text: string | null;
+  gmail_message_id: string | null;
   classification: string;
 }
 
@@ -62,9 +66,18 @@ interface SubmissionDetail {
   resume_title: string | null;
   jd_snapshot: JdSnapshot | null;
   jd_text: string | null;
+  gmail_thread_id: string | null;
   follow_ups: FollowUp[];
   responses: ResponseRow[];
   contacts: ContactSummary[];
+}
+
+interface ReplyContext {
+  gmail_message_id: string;
+  from_email: string | null;
+  subject: string | null;
+  body: string | null;
+  received_at: string | null;
 }
 
 interface ContactOption {
@@ -123,6 +136,24 @@ export default function SubmissionDetail() {
   const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
   const [selectedContactIds, setSelectedContactIds] = useState<number[]>([]);
   const [savingContacts, setSavingContacts] = useState(false);
+  // Gmail integration state. Compose-modal is one of:
+  //   null               → modal closed
+  //   { replyTo: ctx }   → open in reply mode pre-filled from ctx
+  //   {}                 → open in compose mode (fresh message)
+  const [composeOpen, setComposeOpen] = useState<{
+    replyTo?: ReplyContext;
+  } | null>(null);
+  const [expandedResponseIds, setExpandedResponseIds] = useState<Set<number>>(
+    new Set(),
+  );
+  const [linkInput, setLinkInput] = useState('');
+  const [linkSaving, setLinkSaving] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const { status: gmailStatus } = useGmailStatus();
+  const sendEnabled = hasSendScope(gmailStatus);
+  const gmailAvailable = Boolean(
+    gmailStatus && gmailStatus.available && gmailStatus.connected,
+  );
 
   const load = useCallback(async () => {
     try {
@@ -401,6 +432,45 @@ export default function SubmissionDetail() {
     }
   }
 
+  async function handleLinkThread(e: React.FormEvent) {
+    e.preventDefault();
+    if (!linkInput.trim()) return;
+    setLinkSaving(true);
+    setLinkError(null);
+    try {
+      const r = await apiFetch(`/submissions/${id}/gmail-link`, {
+        method: 'PUT',
+        body: JSON.stringify({ mid: linkInput }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text}`);
+      }
+      setLinkInput('');
+      await load();
+    } catch (err) {
+      setLinkError(String(err));
+    } finally {
+      setLinkSaving(false);
+    }
+  }
+
+  async function handleUnlinkThread() {
+    if (!window.confirm('Unlink this Gmail thread? Existing responses stay; new messages stop arriving.')) {
+      return;
+    }
+    setLinkError(null);
+    try {
+      const r = await apiFetch(`/submissions/${id}/gmail-link`, {
+        method: 'DELETE',
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await load();
+    } catch (err) {
+      setLinkError(String(err));
+    }
+  }
+
   if (error && !data) return <Alert variant="danger">{error}</Alert>;
   if (!data) return <Spinner animation="border" size="sm" />;
 
@@ -444,6 +514,22 @@ export default function SubmissionDetail() {
         <span className="ms-3">
           <StatusBadge status={data.status} />
         </span>
+        {sendEnabled && (
+          <Button
+            size="sm"
+            variant="primary"
+            className="ms-auto"
+            onClick={() => setComposeOpen({})}
+            disabled={data.gmail_thread_id !== null}
+            title={
+              data.gmail_thread_id
+                ? 'Submission already linked to a thread; reply from a response row instead'
+                : undefined
+            }
+          >
+            Compose
+          </Button>
+        )}
       </div>
 
       {error && <Alert variant="danger">{error}</Alert>}
@@ -769,22 +855,160 @@ export default function SubmissionDetail() {
         </Card.Body>
       </Card>
 
+      {gmailAvailable && (
+        <Card className="mb-3">
+          <Card.Body>
+            <Card.Subtitle className="text-muted mb-2">Gmail thread</Card.Subtitle>
+            {data.gmail_thread_id ? (
+              <div className="d-flex align-items-center gap-2">
+                <Badge bg="success">Linked</Badge>
+                <code className="small">
+                  {data.gmail_thread_id.slice(0, 16)}…
+                </code>
+                <Button
+                  size="sm"
+                  variant="outline-secondary"
+                  onClick={handleUnlinkThread}
+                >
+                  Unlink
+                </Button>
+              </div>
+            ) : (
+              <Form onSubmit={handleLinkThread}>
+                <Form.Text className="text-muted d-block mb-2">
+                  For submissions you sent through another mail client (or
+                  recruiter-originated chains): paste any Message-ID from
+                  the conversation. In Thunderbird:{' '}
+                  <strong>Right-click → Organize → Copy Message Link</strong>.
+                  In Gmail web: <strong>⋮ → Show original</strong>, then
+                  copy the Message-ID line. The parser handles the
+                  <code className="mx-1">mid:</code> URI form, bare IDs,
+                  and even whole pasted header blocks.
+                </Form.Text>
+                <div className="d-flex gap-2">
+                  <Form.Control
+                    type="text"
+                    placeholder="Paste Message-ID, mid: URI, or full header line…"
+                    value={linkInput}
+                    onChange={(e) => setLinkInput(e.target.value)}
+                    disabled={linkSaving}
+                  />
+                  <Button type="submit" disabled={linkSaving || !linkInput.trim()}>
+                    {linkSaving ? 'Linking…' : 'Link'}
+                  </Button>
+                </div>
+                {linkError && (
+                  <Alert variant="danger" className="mt-2 mb-0">
+                    {linkError}
+                  </Alert>
+                )}
+              </Form>
+            )}
+          </Card.Body>
+        </Card>
+      )}
+
       {data.responses.length > 0 && (
         <Card className="mb-3">
           <Card.Body>
             <Card.Subtitle className="text-muted mb-2">Responses</Card.Subtitle>
-            <ul className="mb-0">
-              {data.responses.map((r) => (
-                <li key={r.id}>
-                  <Badge bg="info" className="me-2">
-                    {r.classification}
-                  </Badge>
-                  {r.subject ?? '(no subject)'} — {r.received_at ?? ''}
-                </li>
-              ))}
+            <ul className="list-unstyled mb-0">
+              {data.responses.map((r) => {
+                const isExpanded = expandedResponseIds.has(r.id);
+                const hasBody = Boolean(r.body_text && r.body_text.length > 0);
+                const toggleExpanded = () => {
+                  setExpandedResponseIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(r.id)) next.delete(r.id);
+                    else next.add(r.id);
+                    return next;
+                  });
+                };
+                return (
+                  <li key={r.id} className="border-bottom py-2">
+                    <div className="d-flex align-items-center gap-2">
+                      <Badge bg="info">{r.classification}</Badge>
+                      <span className="flex-grow-1">
+                        {hasBody ? (
+                          <Button
+                            variant="link"
+                            size="sm"
+                            className="p-0 align-baseline text-start text-decoration-none"
+                            onClick={toggleExpanded}
+                          >
+                            <span className="me-1">{isExpanded ? '▾' : '▸'}</span>
+                            {r.subject ?? '(no subject)'}
+                          </Button>
+                        ) : (
+                          <span>{r.subject ?? '(no subject)'}</span>
+                        )}
+                        {r.from_email && (
+                          <span className="text-muted small ms-2">
+                            from {r.from_email}
+                          </span>
+                        )}
+                        {r.received_at && (
+                          <span className="text-muted small ms-2">
+                            {r.received_at}
+                          </span>
+                        )}
+                      </span>
+                      {sendEnabled && r.gmail_message_id && (
+                        <Button
+                          size="sm"
+                          variant="outline-primary"
+                          onClick={() =>
+                            setComposeOpen({
+                              replyTo: {
+                                gmail_message_id: r.gmail_message_id!,
+                                from_email: r.from_email,
+                                subject: r.subject,
+                                body: r.body_text,
+                                received_at: r.received_at,
+                              },
+                            })
+                          }
+                        >
+                          Reply
+                        </Button>
+                      )}
+                    </div>
+                    {isExpanded && hasBody && (
+                      <pre
+                        className="small text-muted mt-2 mb-0 ms-4 p-2 bg-light rounded"
+                        style={{
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          maxHeight: 400,
+                          overflowY: 'auto',
+                        }}
+                      >
+                        {r.body_text}
+                      </pre>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </Card.Body>
         </Card>
+      )}
+
+      {composeOpen && data && (
+        <GmailComposeModal
+          show={true}
+          onHide={() => setComposeOpen(null)}
+          submissionId={Number(id)}
+          replyTo={composeOpen.replyTo}
+          defaultResumeId={data.resume_id ?? null}
+          onSent={() => {
+            setComposeOpen(null);
+            load();
+          }}
+          onNeedReconsent={() => {
+            window.location.href = '/settings';
+          }}
+        />
       )}
     </>
   );

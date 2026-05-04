@@ -15,6 +15,7 @@ import ContactDetail from './pages/ContactDetail';
 import FollowUps from './pages/FollowUps';
 import Health from './pages/Health';
 import Login from './pages/Login';
+import Settings from './pages/Settings';
 import ComingSoon from './pages/ComingSoon';
 
 export default function App() {
@@ -49,6 +50,7 @@ export default function App() {
           <Route path="contacts/:id" element={<ContactDetail />} />
           <Route path="follow-ups" element={<FollowUps />} />
           <Route path="targets" element={<Targets />} />
+          <Route path="settings" element={<Settings />} />
           <Route path="health" element={<Health />} />
           <Route
             path="*"

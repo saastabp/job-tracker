@@ -53,9 +53,18 @@ Parameters:
     Type: String
     Default: 'arn:aws:iam::000000000000:role/none'
     Description: ARN of the role EventBridge Scheduler assumes to invoke the notify Lambda (from the scheduler stack). Inert default when SchedulerGroupName is empty.
+  GmailKmsKeyId:
+    Type: String
+    Default: ''
+    Description: Gmail KMS key ID from /jobtracker/gmail/kms-key-id (gmail stack). Empty = gmail stack not deployed; OAuth routes are not registered.
+  SpaUrl:
+    Type: String
+    Default: 'http://localhost:5173'
+    Description: SPA base URL the OAuth callback redirects to after success/failure. Set by deploy-api / wire-frontend from /jobtracker/dns/app-url (preferred) or /jobtracker/frontend/cloudfront-url.
 
 Conditions:
   HasScheduler: !Not [!Equals [!Ref SchedulerGroupName, '']]
+  HasGmail: !Not [!Equals [!Ref GmailKmsKeyId, '']]
 
 Globals:
   Function:
@@ -539,6 +548,175 @@ Resources:
           Properties:
             ApiId: !Ref HttpApi
             Path: /resumes/{id}/purge
+            Method: POST
+
+  # Gmail OAuth function — conditional on the gmail stack being deployed
+  # (which publishes /jobtracker/gmail/kms-key-id, fetched by deploy-api
+  # and passed in as GmailKmsKeyId). When gmail isn't deployed, the
+  # function isn't created and the routes return 404 from API Gateway
+  # before any Lambda involvement.
+  #
+  # Two routes, one Lambda. The /start route inherits the api's default
+  # Cognito authorizer (the SPA invokes it with a JWT). The /callback
+  # route is hit by Google's 302 redirect in the user's browser, which
+  # carries no Authorization header — `Auth: Authorizer: NONE` overrides
+  # the default. CSRF protection comes from the per-user state token
+  # stored on `users.gmail_oauth_state` at /start time and validated at
+  # /callback.
+  GmailOAuthFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasGmail
+    Properties:
+      FunctionName: jobtracker-gmail-oauth
+      CodeUri: ../../backend/src
+      Handler: handlers.gmail_oauth.handler
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          GMAIL_KMS_KEY_ID: !Ref GmailKmsKeyId
+          GMAIL_OAUTH_CLIENT_SSM_PATH: '/jobtracker/gmail/oauth-client'
+          SPA_REDIRECT_URL: !Ref SpaUrl
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              Action: kms:Encrypt
+              Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${GmailKmsKeyId}'
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobtracker/gmail/oauth-client'
+      Events:
+        Start:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /integrations/gmail/oauth/start
+            Method: GET
+        Callback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /integrations/gmail/oauth/callback
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  # Gmail admin function — connection status, disconnect, link/unlink
+  # thread for a submission. Same conditional pattern as GmailOAuthFunction:
+  # only created when GmailKmsKeyId is non-empty (gmail stack deployed).
+  # All four routes are Cognito-authenticated by the api's default
+  # authorizer; no per-route overrides needed.
+  GmailAdminFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasGmail
+    Properties:
+      FunctionName: jobtracker-gmail-admin
+      CodeUri: ../../backend/src
+      Handler: handlers.gmail_admin.handler
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          GMAIL_KMS_KEY_ID: !Ref GmailKmsKeyId
+          GMAIL_OAUTH_CLIENT_SSM_PATH: '/jobtracker/gmail/oauth-client'
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              # kms:Decrypt only — encryption happens in the OAuth callback
+              # function (which has only kms:Encrypt). Different roles,
+              # different perms.
+              Action: kms:Decrypt
+              Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${GmailKmsKeyId}'
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobtracker/gmail/oauth-client'
+      Events:
+        Status:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /integrations/gmail/status
+            Method: GET
+        Disconnect:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /integrations/gmail
+            Method: DELETE
+        LinkThread:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}/gmail-link
+            Method: PUT
+        UnlinkThread:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}/gmail-link
+            Method: DELETE
+
+  # Gmail compose function — POST /submissions/{id}/send. Sends a new
+  # message (compose mode) or replies to an existing one (reply mode)
+  # via the Gmail API. Optional resume PDF attachment fetched from the
+  # resume S3 bucket. Conditional on the gmail stack being deployed.
+  GmailComposeFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasGmail
+    Properties:
+      FunctionName: jobtracker-gmail-compose
+      CodeUri: ../../backend/src
+      Handler: handlers.gmail_compose.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          GMAIL_KMS_KEY_ID: !Ref GmailKmsKeyId
+          GMAIL_OAUTH_CLIENT_SSM_PATH: '/jobtracker/gmail/oauth-client'
+          RESUME_BUCKET: !Ref ResumeBucketName
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+            - Effect: Allow
+              # kms:Decrypt for the refresh token. (The OAuth function
+              # has Encrypt; the admin function has Decrypt; this one
+              # has Decrypt too — different roles, scoped by need.)
+              Action: kms:Decrypt
+              Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${GmailKmsKeyId}'
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jobtracker/gmail/oauth-client'
+            - Effect: Allow
+              # Read resume PDFs for attachment.
+              Action: s3:GetObject
+              Resource: !Sub '${ResumeBucketArn}/users/*'
+      Events:
+        Send:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /submissions/{id}/send
             Method: POST
 
   PostConfirmationCognitoPermission:

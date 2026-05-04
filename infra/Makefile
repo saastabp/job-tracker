@@ -1,6 +1,6 @@
 .PHONY: help check-prereqs fetch-rds-ca \
-        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-dns deploy-all \
-        wire-frontend migrate delete-ai delete-scheduler delete-dns db-creds \
+        deploy-network deploy-data deploy-auth deploy-api deploy-frontend deploy-ai deploy-scheduler deploy-gmail deploy-dns deploy-all \
+        wire-frontend migrate delete-ai delete-scheduler delete-gmail delete-dns db-creds \
         gen-frontend-env dev-frontend sync-frontend \
         list-ssm clean
 
@@ -26,6 +26,8 @@ help:
 	@echo "  delete-ai         Tear down the AI stack"
 	@echo "  deploy-scheduler  Deploy scheduler stack (EventBridge Scheduler + follow-up notify Lambda + SES verified identity)"
 	@echo "  delete-scheduler  Tear down the scheduler stack (follow_ups rows persist; reminders stop firing)"
+	@echo "  deploy-gmail      Deploy gmail stack (KMS key for refresh tokens + S3 archive bucket; see infra/gmail/GCP-SETUP.md for the GCP-side setup)"
+	@echo "  delete-gmail      Tear down the gmail stack (KMS key + bucket retained; SSM params cleared)"
 	@echo "  deploy-dns        Deploy dns stack in us-east-1 (ACM cert + Route 53 alias) and re-deploy frontend with the alias attached"
 	@echo "  delete-dns        Tear down the dns stack (cert + alias records); SPA falls back to its cloudfront.net domain after deploy-frontend"
 	@echo "  deploy-all        Deploy all stacks in dependency order, then wire-frontend"
@@ -82,13 +84,17 @@ deploy-api: deploy-network deploy-data deploy-auth fetch-rds-ca
 	SCHED_GROUP=$$(aws ssm get-parameter --name /jobtracker/scheduler/group-name --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	SCHED_TARGET=$$(aws ssm get-parameter --name /jobtracker/scheduler/notify-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	SCHED_ROLE=$$(aws ssm get-parameter --name /jobtracker/scheduler/exec-role-arn --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
+	GMAIL_KMS_KEY_ID=$$(aws ssm get-parameter --name /jobtracker/gmail/kms-key-id --query Parameter.Value --output text --region $(REGION) 2>/dev/null); \
 	ARGS=""; \
 	if [ -n "$$CF_URL" ]; then \
 		ORIGINS="http://localhost:5173,$$CF_URL"; \
 		if [ -n "$$APP_URL" ]; then ORIGINS="$$ORIGINS,$$APP_URL"; fi; \
 		ARGS="$$ARGS CorsOrigins=$$ORIGINS"; \
 	fi; \
+	if [ -n "$$APP_URL" ]; then ARGS="$$ARGS SpaUrl=$$APP_URL"; \
+	elif [ -n "$$CF_URL" ]; then ARGS="$$ARGS SpaUrl=$$CF_URL"; fi; \
 	if [ -n "$$SCHED_GROUP" ]; then ARGS="$$ARGS SchedulerGroupName=$$SCHED_GROUP SchedulerNotifyArn=$$SCHED_TARGET SchedulerRoleArn=$$SCHED_ROLE"; fi; \
+	if [ -n "$$GMAIL_KMS_KEY_ID" ]; then ARGS="$$ARGS GmailKmsKeyId=$$GMAIL_KMS_KEY_ID"; fi; \
 	if [ -n "$$ARGS" ]; then \
 		cd $(ROOT)/infra/api && sam build && sam deploy --parameter-overrides $$ARGS; \
 	else \
@@ -169,14 +175,41 @@ delete-scheduler:
 	@aws ssm delete-parameter --name /jobtracker/scheduler/notify-arn --region $(REGION) 2>/dev/null || true
 	@aws ssm delete-parameter --name /jobtracker/scheduler/exec-role-arn --region $(REGION) 2>/dev/null || true
 
+# Gmail stack (slice 09) — KMS key + archive S3 bucket + SSM placeholders.
+# Lambda functions (oauth, admin, poller, compose) land in subsequent slice
+# 09 phases. The KMS key + archive bucket are DeletionPolicy: Retain so
+# `delete-gmail` leaves the encrypted refresh tokens and archived mail
+# undisturbed; full cleanup requires manual S3 bucket emptying + KMS key
+# scheduled deletion if you want the stateful resources gone.
+#
+# Per stack-segregation rule: tearable down without touching api/data.
+# After deploy, follow infra/gmail/GCP-SETUP.md to create the OAuth
+# client in GCP and store its credentials in the SecureString SSM
+# parameter `/jobtracker/gmail/oauth-client`.
+deploy-gmail:
+	cd $(ROOT)/infra/gmail && sam build && sam deploy
+
+delete-gmail:
+	cd $(ROOT)/infra/gmail && sam delete --no-prompts
+	@aws ssm delete-parameter --name /jobtracker/gmail/kms-key-id --region $(REGION) 2>/dev/null || true
+	@aws ssm delete-parameter --name /jobtracker/gmail/kms-key-arn --region $(REGION) 2>/dev/null || true
+	@aws ssm delete-parameter --name /jobtracker/gmail/archive-bucket --region $(REGION) 2>/dev/null || true
+	@echo "Note: /jobtracker/gmail/oauth-client SecureString and the gmail KMS key + archive bucket are NOT deleted."
+	@echo "If you want them gone, run:"
+	@echo "  aws ssm delete-parameter --name /jobtracker/gmail/oauth-client --region $(REGION)"
+	@echo "  aws s3 rm s3://jobtracker-gmail-archive-<acct>/ --recursive && aws s3 rb s3://jobtracker-gmail-archive-<acct>"
+	@echo "  aws kms schedule-key-deletion --key-id <key-id> --pending-window-in-days 7 --region $(REGION)"
+
 # deploy-dns is intentionally not in deploy-all's dependency chain — it's a
 # manual upgrade step (custom domain is opt-in, ACM validation is slow).
 # Run `make deploy-dns` separately after deploy-all if you want the alias.
-deploy-all: deploy-network deploy-data deploy-auth deploy-scheduler deploy-api deploy-frontend deploy-ai wire-frontend
+deploy-all: deploy-network deploy-data deploy-auth deploy-scheduler deploy-gmail deploy-api deploy-frontend deploy-ai wire-frontend
 	@echo
 	@echo "All stacks deployed and CloudFront URL wired into auth + api + ai."
 	@echo "Next: one-time bootstrap of the MySQL 'app' user (see README), and"
 	@echo "  click the SES verification email sent to the SenderEmail address."
+	@echo "  For Gmail integration, follow infra/gmail/GCP-SETUP.md to create"
+	@echo "  the GCP OAuth client and store credentials in SSM."
 	@echo "  For a custom domain (e.g. jobs.crazylittledog.link), run 'make deploy-dns'."
 
 wire-frontend:

@@ -7,6 +7,8 @@ dependencies = [
     "aws-lambda-powertools>=3.0",
     "pymysql>=1.1",
     "boto3>=1.34",
+    "google-auth>=2.30",
+    "google-api-python-client>=2.140",
 ]
 
 [project.optional-dependencies]

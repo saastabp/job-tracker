@@ -407,6 +407,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
                 s.resume_id, r.title AS resume_title,
                 ss.short_name AS status,
                 s.tailored_title, s.tailored_summary, s.jd_url,
+                s.gmail_thread_id,
                 s.created_at, s.updated_at
             FROM submissions s
             JOIN submission_statuses ss ON ss.id = s.submission_status_id
@@ -452,6 +453,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
             """
             SELECT
                 r.id, r.received_at, r.from_email, r.subject,
+                r.body_text, r.gmail_message_id,
                 rc.short_name AS classification
             FROM responses r
             JOIN response_classifications rc ON rc.id = r.response_classification_id
@@ -466,6 +468,8 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
                 "received_at": str(r["received_at"]) if r["received_at"] else None,
                 "from_email": r["from_email"],
                 "subject": r["subject"],
+                "body_text": r.get("body_text"),
+                "gmail_message_id": r.get("gmail_message_id"),
                 "classification": r["classification"],
             }
             for r in cur.fetchall()
@@ -509,6 +513,7 @@ def _detail(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
         else None
     )
     detail["jd_text"] = _read_jd_text(jd_row["s3_key"]) if jd_row else None
+    detail["gmail_thread_id"] = row.get("gmail_thread_id")
     detail["follow_ups"] = follow_ups
     detail["responses"] = responses
     detail["contacts"] = contacts
