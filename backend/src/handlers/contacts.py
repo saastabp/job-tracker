@@ -209,6 +209,8 @@ def _detail(conn: Any, user_id: int, contact_id: int) -> dict[str, Any]:
             """
             SELECT
                 co.id, co.outreach_at, co.notes,
+                co.subject, co.body_text, co.from_email,
+                co.gmail_thread_id, co.gmail_message_id,
                 om.short_name AS method,
                 od.short_name AS direction
             FROM contact_outreach co
@@ -228,6 +230,11 @@ def _detail(conn: Any, user_id: int, contact_id: int) -> dict[str, Any]:
                 "method": r["method"],
                 "direction": r["direction"],
                 "notes": r["notes"],
+                "subject": r.get("subject"),
+                "body_text": r.get("body_text"),
+                "from_email": r.get("from_email"),
+                "gmail_thread_id": r.get("gmail_thread_id"),
+                "gmail_message_id": r.get("gmail_message_id"),
             }
             for r in cur.fetchall()
         ]

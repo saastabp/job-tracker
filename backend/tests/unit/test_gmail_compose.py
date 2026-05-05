@@ -1,13 +1,17 @@
 """Unit tests for ``handlers/gmail_compose.py``.
 
+The route is ``POST /messages/send``. Body carries ``submission_id?``
+and ``contact_id?``; at least one is required (Fork 4 — slice-10 plan).
+
 Three layers covered:
 
 1. The MIME builder (``_build_mime``) — header construction, plaintext
    body, attachment, threading headers in reply mode.
-2. The orchestration in ``_send`` — scope gate, mode selection
+2. The orchestration in ``_send`` — scope gate, anchor validation
+   (submission-only / contact-only / both / neither), mode selection
    (compose vs reply), submission state coupling (must / must-not have
-   ``gmail_thread_id``), thread_id persistence on compose, mismatch
-   detection on reply.
+   ``gmail_thread_id``), thread_id persistence on compose, contact_outreach
+   row insertion, mismatch detection on reply.
 3. The handler-level dispatch — auth, validation, error mapping.
 
 External calls mocked:
@@ -24,6 +28,9 @@ import json
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default as _default_policy
+from unittest.mock import MagicMock
+
+import pytest
 
 
 def message_from_bytes(raw: bytes) -> EmailMessage:
@@ -35,9 +42,6 @@ def message_from_bytes(raw: bytes) -> EmailMessage:
     default)`` returns the modern API.
     """
     return BytesParser(policy=_default_policy).parsebytes(raw)
-from unittest.mock import MagicMock
-
-import pytest
 
 
 def _set_env(monkeypatch):
@@ -55,9 +59,9 @@ def _import_fresh():
     return gmail_compose
 
 
-def _auth_event(*, body: dict | None = None, path_id: int | None = 7):
+def _auth_event(*, body: dict | None = None):
     e: dict = {
-        "routeKey": "POST /submissions/{id}/send",
+        "routeKey": "POST /messages/send",
         "requestContext": {
             "authorizer": {
                 "jwt": {"claims": {"sub": "user-sub-1", "email": "x@y.z"}}
@@ -66,8 +70,6 @@ def _auth_event(*, body: dict | None = None, path_id: int | None = 7):
     }
     if body is not None:
         e["body"] = json.dumps(body)
-    if path_id is not None:
-        e["pathParameters"] = {"id": str(path_id)}
     return e
 
 
@@ -104,13 +106,11 @@ def _mock_google_libs(
     ``users().messages().send`` and ``users().messages().get`` calls."""
     mocker.patch.object(gmail_compose, "build_credentials", return_value=MagicMock())
 
-    # send() chain
     send_execute = MagicMock(
         return_value={"id": sent_message_id, "threadId": sent_thread_id}
     )
     send_call = MagicMock(return_value=MagicMock(execute=send_execute))
 
-    # get() chain — used in reply mode to fetch the original message's headers
     headers = []
     if in_reply_to_rfc:
         headers.append({"name": "Message-Id", "value": in_reply_to_rfc})
@@ -139,6 +139,14 @@ def _readonly_only() -> str:
     return "https://www.googleapis.com/auth/gmail.readonly"
 
 
+# Catalog rows the contact_outreach insert path looks up. Each entry is a
+# pair of (table-name-substring, fake-row) since `_catalog_id` issues a
+# `SELECT id FROM <table>...`. Order follows the call order in `_send`:
+# direction first, method second.
+_CATALOG_DIRECTION_OUTBOUND = {"id": 71}
+_CATALOG_METHOD_EMAIL = {"id": 81}
+
+
 # ---------------------------------------------------------------------------
 # MIME builder
 # ---------------------------------------------------------------------------
@@ -165,7 +173,6 @@ class TestMimeBuilder:
         assert parsed["Subject"] == "Hello"
         assert parsed["Cc"] is None
         assert parsed["In-Reply-To"] is None
-        # Body
         body = parsed.get_body(preferencelist=("plain",))
         assert body.get_content().strip() == "Hi there."
 
@@ -233,12 +240,12 @@ class TestMimeBuilder:
 
 
 # ---------------------------------------------------------------------------
-# Orchestration (handler dispatch)
+# Submission-only path (slice-9 carry-over, new route)
 # ---------------------------------------------------------------------------
 
 
-class TestHandlerCompose:
-    """compose mode (no in_reply_to_message_id)"""
+class TestSubmissionOnly:
+    """``submission_id`` set, ``contact_id`` null."""
 
     def _run(
         self,
@@ -285,6 +292,7 @@ class TestHandlerCompose:
                 "to": ["recruiter@acme.com"],
                 "subject": "Application — Senior SRE",
                 "body": "Hi! Excited about the role. Please find my resume.",
+                "submission_id": 7,
             },
             submission_thread_id=None,
             sent_thread_id="thread-new",
@@ -294,13 +302,11 @@ class TestHandlerCompose:
         assert body["thread_id"] == "thread-new"
         assert body["gmail_message_id"] == "sent-msg-1"
 
-        # send() called without threadId in the body (compose mode)
         send_kwargs = send_call.call_args.kwargs
         assert send_kwargs["userId"] == "me"
         assert "threadId" not in send_kwargs["body"]
         assert "raw" in send_kwargs["body"]
 
-        # submissions.gmail_thread_id set from the response
         update_calls = [
             c for c in cursor.execute.call_args_list
             if "UPDATE submissions SET gmail_thread_id" in c.args[0]
@@ -308,13 +314,24 @@ class TestHandlerCompose:
         assert len(update_calls) == 1
         assert update_calls[0].args[1] == ("thread-new", 7, 42)
 
+        # contact_id is null → no contact_outreach insert.
+        co_inserts = [
+            c for c in cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 0
+
     def test_already_linked_returns_400(
         self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
     ):
-        # Compose mode against a submission that already has a thread → error.
         out, _cursor, _gc, _send = self._run(
             mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
-            body={"to": ["a@x.com"], "subject": "S", "body": "B"},
+            body={
+                "to": ["a@x.com"],
+                "subject": "S",
+                "body": "B",
+                "submission_id": 7,
+            },
             submission_thread_id="existing-thread",
         )
         assert out["statusCode"] == 400
@@ -325,7 +342,12 @@ class TestHandlerCompose:
     ):
         out, _cursor, _gc, _send = self._run(
             mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
-            body={"to": ["a@x.com"], "subject": "S", "body": "B"},
+            body={
+                "to": ["a@x.com"],
+                "subject": "S",
+                "body": "B",
+                "submission_id": 7,
+            },
             scopes=_readonly_only(),
         )
         assert out["statusCode"] == 403
@@ -337,7 +359,7 @@ class TestHandlerCompose:
     ):
         out, _c, _gc, _s = self._run(
             mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
-            body={"subject": "S", "body": "B"},
+            body={"subject": "S", "body": "B", "submission_id": 7},
         )
         assert out["statusCode"] == 400
         assert "to is required" in json.loads(out["body"])["error"]
@@ -347,15 +369,221 @@ class TestHandlerCompose:
     ):
         out, _c, _gc, _s = self._run(
             mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
-            body={"to": ["a@x.com"], "body": "B"},
+            body={"to": ["a@x.com"], "body": "B", "submission_id": 7},
         )
         assert out["statusCode"] == 400
         assert "subject is required" in json.loads(out["body"])["error"]
 
 
-class TestHandlerReply:
-    """reply mode (in_reply_to_message_id present)"""
+# ---------------------------------------------------------------------------
+# Contact-only path (new in slice 10)
+# ---------------------------------------------------------------------------
 
+
+class TestContactOnly:
+    """``contact_id`` set, ``submission_id`` null."""
+
+    def _run(
+        self,
+        mocker,
+        monkeypatch,
+        lambda_ctx,
+        mock_cursor,
+        patched_conn,
+        *,
+        body: dict,
+        contact_found: bool = True,
+        sent_thread_id: str = "thread-new",
+    ):
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {  # gmail_credentials
+                "gmail_address": "user@gmail.com",
+                "refresh_token_ciphertext": b"\x01\x02ciph",
+                "scopes": _both_scopes(),
+            },
+            {"id": 11} if contact_found else None,  # contact lookup
+            _CATALOG_DIRECTION_OUTBOUND,
+            _CATALOG_METHOD_EMAIL,
+        ]
+        patched_conn("handlers.gmail_compose")
+        _mock_ssm(mocker, gmail_compose)
+        _mock_kms(mocker)
+        _service, send_call = _mock_google_libs(
+            mocker, gmail_compose, sent_thread_id=sent_thread_id
+        )
+
+        out = gmail_compose.handler(_auth_event(body=body), lambda_ctx)
+        return out, mock_cursor, send_call
+
+    def test_happy_path_inserts_contact_outreach(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        out, cursor, send_call = self._run(
+            mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
+            body={
+                "to": ["maria@coldoutreach.com"],
+                "subject": "Quick intro",
+                "body": "Hi Maria — saw your post about hiring SREs.",
+                "contact_id": 11,
+            },
+            sent_thread_id="thread-cold-1",
+        )
+        assert out["statusCode"] == 200
+        body = json.loads(out["body"])
+        assert body["thread_id"] == "thread-cold-1"
+        assert body["gmail_message_id"] == "sent-msg-1"
+
+        send_kwargs = send_call.call_args.kwargs
+        assert "threadId" not in send_kwargs["body"]
+
+        # No submission update (no submission_id).
+        assert not any(
+            "UPDATE submissions SET gmail_thread_id" in c.args[0]
+            for c in cursor.execute.call_args_list
+        )
+
+        # contact_outreach insert with the right shape.
+        co_inserts = [
+            c for c in cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 1
+        params = co_inserts[0].args[1]
+        # (user_id, contact_id, method_id, direction_id,
+        #  thread_id, gmail_message_id, subject, body_text, from_email)
+        assert params[0] == 42
+        assert params[1] == 11
+        assert params[2] == _CATALOG_METHOD_EMAIL["id"]
+        assert params[3] == _CATALOG_DIRECTION_OUTBOUND["id"]
+        assert params[4] == "thread-cold-1"
+        assert params[5] == "sent-msg-1"
+        assert params[6] == "Quick intro"
+        assert params[7] == "Hi Maria — saw your post about hiring SREs."
+        assert params[8] == "user@gmail.com"
+
+    def test_reply_with_contact_only_rejected(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        # Reply mode requires submission_id; contact-only reply isn't
+        # supported in v1.
+        out, _cursor, _send = self._run(
+            mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
+            body={
+                "to": ["maria@coldoutreach.com"],
+                "subject": "Re: Quick intro",
+                "body": "Sounds great!",
+                "contact_id": 11,
+                "in_reply_to_message_id": "gmail-msg-id-orig",
+            },
+        )
+        assert out["statusCode"] == 400
+        assert "reply requires submission_id" in json.loads(out["body"])["error"]
+
+    def test_contact_not_found_returns_404(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        out, _cursor, _send = self._run(
+            mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
+            body={
+                "to": ["a@x.com"],
+                "subject": "S",
+                "body": "B",
+                "contact_id": 999,
+            },
+            contact_found=False,
+        )
+        assert out["statusCode"] == 404
+        assert "contact not found" in json.loads(out["body"])["error"]
+
+
+# ---------------------------------------------------------------------------
+# Both anchors (submission + contact)
+# ---------------------------------------------------------------------------
+
+
+class TestBothAnchors:
+    def test_dual_write_in_compose_mode(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {  # gmail_credentials
+                "gmail_address": "user@gmail.com",
+                "refresh_token_ciphertext": b"\x01\x02ciph",
+                "scopes": _both_scopes(),
+            },
+            {"id": 7, "gmail_thread_id": None},  # submission
+            {"id": 11},                           # contact
+            _CATALOG_DIRECTION_OUTBOUND,
+            _CATALOG_METHOD_EMAIL,
+        ]
+        patched_conn("handlers.gmail_compose")
+        _mock_ssm(mocker, gmail_compose)
+        _mock_kms(mocker)
+        _service, send_call = _mock_google_libs(
+            mocker, gmail_compose, sent_thread_id="thread-both"
+        )
+
+        out = gmail_compose.handler(
+            _auth_event(
+                body={
+                    "to": ["recruiter@acme.com"],
+                    "subject": "Application via Maria",
+                    "body": "Hi — Maria suggested I reach out for the SRE role.",
+                    "submission_id": 7,
+                    "contact_id": 11,
+                }
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 200
+        body = json.loads(out["body"])
+        assert body["thread_id"] == "thread-both"
+
+        # Both writes happened.
+        update_calls = [
+            c for c in mock_cursor.execute.call_args_list
+            if "UPDATE submissions SET gmail_thread_id" in c.args[0]
+        ]
+        assert len(update_calls) == 1
+        assert update_calls[0].args[1] == ("thread-both", 7, 42)
+
+        co_inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 1
+        assert co_inserts[0].args[1][1] == 11  # contact_id
+        assert co_inserts[0].args[1][4] == "thread-both"
+
+        # Both writes share the same connection; commit fired once after
+        # both writes (atomicity proxy — same conn.commit call covers both).
+        # We can sanity-check by ensuring the contact_outreach insert
+        # happened in the call sequence AFTER the submission update.
+        idx_update = next(
+            i for i, c in enumerate(mock_cursor.execute.call_args_list)
+            if "UPDATE submissions SET gmail_thread_id" in c.args[0]
+        )
+        idx_co = next(
+            i for i, c in enumerate(mock_cursor.execute.call_args_list)
+            if "INSERT INTO contact_outreach" in c.args[0]
+        )
+        assert idx_co > idx_update
+
+
+# ---------------------------------------------------------------------------
+# Reply mode (submission anchor required)
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerReply:
     def _run(
         self,
         mocker,
@@ -385,7 +613,7 @@ class TestHandlerReply:
         patched_conn("handlers.gmail_compose")
         _mock_ssm(mocker, gmail_compose)
         _mock_kms(mocker)
-        service, send_call = _mock_google_libs(
+        _service, send_call = _mock_google_libs(
             mocker,
             gmail_compose,
             sent_thread_id=sent_thread_id,
@@ -405,6 +633,7 @@ class TestHandlerReply:
                 "subject": "Re: Application",
                 "body": "Thanks for getting back!",
                 "in_reply_to_message_id": "gmail-msg-id-123",
+                "submission_id": 7,
             },
             submission_thread_id="thread-abc",
             sent_thread_id="thread-abc",
@@ -413,11 +642,9 @@ class TestHandlerReply:
         body = json.loads(out["body"])
         assert body["thread_id"] == "thread-abc"
 
-        # send body should include threadId
         send_kwargs = send_call.call_args.kwargs
         assert send_kwargs["body"]["threadId"] == "thread-abc"
 
-        # The raw RFC 822 should include In-Reply-To header
         raw_b64 = send_kwargs["body"]["raw"]
         raw = base64.urlsafe_b64decode(raw_b64)
         parsed = message_from_bytes(raw)
@@ -434,6 +661,7 @@ class TestHandlerReply:
                 "subject": "S",
                 "body": "B",
                 "in_reply_to_message_id": "gmail-msg-id-123",
+                "submission_id": 7,
             },
             submission_thread_id="thread-abc",
             sent_thread_id="thread-abc",
@@ -459,8 +687,9 @@ class TestHandlerReply:
                 "subject": "S",
                 "body": "B",
                 "in_reply_to_message_id": "gmail-msg-id-123",
+                "submission_id": 7,
             },
-            submission_thread_id=None,  # not linked
+            submission_thread_id=None,
             sent_thread_id="thread-abc",
         )
         assert out["statusCode"] == 400
@@ -469,10 +698,10 @@ class TestHandlerReply:
     def test_thread_id_mismatch_raises(
         self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
     ):
-        # Reply mode where Gmail returns a different threadId than what we
-        # have on the submission. Should never happen in practice (Gmail's
-        # threadId guard catches this), but if it does we surface it as a
-        # 5xx via re-raise.
+        # Reply mode where Gmail returns a different threadId than the
+        # one stored on the submission. Should never happen in practice
+        # (Gmail's threadId guard catches this), but if it does we
+        # surface it as a 5xx via re-raise.
         with pytest.raises(RuntimeError, match="thread_id mismatch"):
             self._run(
                 mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
@@ -481,10 +710,68 @@ class TestHandlerReply:
                     "subject": "S",
                     "body": "B",
                     "in_reply_to_message_id": "gmail-msg-id-123",
+                    "submission_id": 7,
                 },
                 submission_thread_id="thread-abc",
                 sent_thread_id="thread-different",
             )
+
+
+# ---------------------------------------------------------------------------
+# Anchor validation
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorValidation:
+    def test_neither_anchor_returns_400(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {  # gmail_credentials
+                "gmail_address": "user@gmail.com",
+                "refresh_token_ciphertext": b"\x01\x02ciph",
+                "scopes": _both_scopes(),
+            },
+        ]
+        patched_conn("handlers.gmail_compose")
+
+        out = gmail_compose.handler(
+            _auth_event(
+                body={
+                    "to": ["a@x.com"],
+                    "subject": "S",
+                    "body": "B",
+                }
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 400
+        assert "submission_id or contact_id" in json.loads(out["body"])["error"]
+
+    def test_invalid_route_returns_404(
+        self, monkeypatch, lambda_ctx, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+        event = {
+            "routeKey": "POST /something/else",
+            "requestContext": {
+                "authorizer": {
+                    "jwt": {"claims": {"sub": "user-sub-1", "email": "x@y.z"}}
+                },
+            },
+        }
+        out = gmail_compose.handler(event, lambda_ctx)
+        assert out["statusCode"] == 404
+
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
 
 
 class TestHandlerMisc:
@@ -506,6 +793,7 @@ class TestHandlerMisc:
                     "to": ["a@x.com"],
                     "subject": "S",
                     "body": "B",
+                    "submission_id": 7,
                 }
             ),
             lambda_ctx,
@@ -534,7 +822,6 @@ class TestHandlerMisc:
         _mock_ssm(mocker, gmail_compose)
         _mock_kms(mocker)
 
-        # Mock S3 returning PDF bytes
         fake_s3 = MagicMock()
         fake_body = MagicMock()
         fake_body.read.return_value = b"%PDF-1.4 fake content"
@@ -552,19 +839,18 @@ class TestHandlerMisc:
                     "subject": "Application",
                     "body": "Hi.",
                     "resume_id": 9,
+                    "submission_id": 7,
                 }
             ),
             lambda_ctx,
         )
         assert out["statusCode"] == 200
 
-        # S3 was hit with the right key
         fake_s3.get_object.assert_called_once_with(
             Bucket="test-resume-bucket",
             Key="users/user-sub-1/resumes/9.pdf",
         )
 
-        # The raw email contains a PDF attachment with the right filename
         raw_b64 = send_call.call_args.kwargs["body"]["raw"]
         raw = base64.urlsafe_b64decode(raw_b64)
         parsed = message_from_bytes(raw)
@@ -603,6 +889,7 @@ class TestHandlerMisc:
                     "subject": "S",
                     "body": "B",
                     "resume_id": 999,
+                    "submission_id": 7,
                 }
             ),
             lambda_ctx,

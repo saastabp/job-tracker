@@ -1,14 +1,20 @@
 """Unit tests for ``handlers/gmail_poller.py``.
 
-The poller has three layers of behavior worth covering independently:
+Slice 10 reshaped this module: the poller now enumerates the union of
+submission- and contact-linked threads, and per non-self-sent message
+dual-writes a ``responses`` row (per matching submission) AND a
+``contact_outreach`` row (most-recent contact_id, Fork 1).
 
-1. The pure-function helpers (`classify`, `_extract_from_email`,
-   `_extract_body_text`) — straightforward parameterized tests.
-2. `_process_message` — the per-message logic (self-sent filter, INSERT
-   IGNORE idempotency, status-bump matrix). All external calls (Gmail
-   API, S3, KMS, classifier catalog lookups) get mocked.
-3. The top-level `handler` — exercises the user → thread → message
-   loop, including isolation (one user's failure doesn't block others).
+Layers covered:
+
+1. Pure helpers (`classify`, `_extract_from_email`, `_extract_body_text`).
+2. ``_insert_response_row`` and ``_insert_contact_outreach_row`` —
+   the per-table write helpers, including INSERT IGNORE idempotency
+   and status-bump matrix.
+3. ``_process_thread`` — the dual-write orchestration: self-sent filter,
+   per-submission response insert, most-recent-contact contact_outreach
+   insert, single S3 archive shared across writes.
+4. ``handler`` — top-level user → thread enumeration, per-user isolation.
 
 External calls mocked:
   * ``boto3`` SSM (OAuth client) via ``_get_ssm``
@@ -93,6 +99,28 @@ def _statuses_map():
         "rejected": 5,
         "ghosted": 6,
     }
+
+
+# Fixed catalog ids the contact_outreach helpers expect.
+EMAIL_METHOD_ID = 81
+INBOUND_DIRECTION_ID = 72
+
+
+def _service_with_thread(messages: list[dict], raw_b64: str = "cmF3IGJ5dGVz"):
+    """Build a Gmail service mock that supports the chains the poller uses."""
+    threads_get_execute = MagicMock(return_value={"messages": messages})
+    threads_get_call = MagicMock(return_value=MagicMock(execute=threads_get_execute))
+    threads = MagicMock(get=threads_get_call)
+
+    raw_get_execute = MagicMock(return_value={"raw": raw_b64})
+    raw_get_call = MagicMock(return_value=MagicMock(execute=raw_get_execute))
+    messages_resource = MagicMock(get=raw_get_call)
+
+    users = MagicMock(
+        threads=MagicMock(return_value=threads),
+        messages=MagicMock(return_value=messages_resource),
+    )
+    return MagicMock(users=MagicMock(return_value=users))
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +232,6 @@ class TestHelpers:
                 },
             ],
         }
-        # text/plain wins over text/html
         assert gmail_poller._extract_body_text(payload) == "hello plain"
 
     def test_body_extraction_html_fallback(self, monkeypatch):
@@ -218,7 +245,6 @@ class TestHelpers:
                 ).decode("ascii")
             },
         }
-        # Tags stripped
         result = gmail_poller._extract_body_text(payload)
         assert "hello" in result
         assert "recruiter" in result
@@ -227,171 +253,61 @@ class TestHelpers:
 
 
 # ---------------------------------------------------------------------------
-# _process_message
+# _insert_response_row
 # ---------------------------------------------------------------------------
 
 
-class TestProcessMessage:
-    def _patch_archive(self, mocker, gmail_poller, succeed: bool = True):
-        fake_s3 = MagicMock()
-        if not succeed:
-            fake_s3.put_object.side_effect = RuntimeError("S3 unreachable")
-        mocker.patch.object(gmail_poller, "_get_s3", return_value=fake_s3)
-        return fake_s3
-
-    def _service_with_raw(self, mocker, raw_b64="cmF3IGJ5dGVz"):
-        execute = MagicMock(return_value={"raw": raw_b64})
-        get_call = MagicMock(return_value=MagicMock(execute=execute))
-        messages = MagicMock(get=get_call)
-        users = MagicMock(messages=MagicMock(return_value=messages))
-        service = MagicMock(users=MagicMock(return_value=users))
-        return service
-
-    def test_self_sent_message_skipped(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
+class TestInsertResponseRow:
+    def _call(
+        self, gmail_poller, *, conn, msg_id="msg-1",
+        classification_short="rejection",
     ):
-        _set_env(monkeypatch)
-        gmail_poller = _import_fresh()
+        from datetime import datetime, timezone
 
-        msg = _make_message(from_addr='"Me" <user@gmail.com>')
-        outcome = gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
+        return gmail_poller._insert_response_row(
+            conn=conn,
             user_id=42,
             submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
+            msg_id=msg_id,
+            received_at=datetime(2024, 5, 2, tzinfo=timezone.utc),
+            from_email="recruiter@acme.com",
+            subject="S",
+            body_text="B",
+            s3_key="42/msg-1.eml",
+            classification_short=classification_short,
             classifications=_classifications_map(),
             statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-        assert outcome == "skipped:self_sent"
-        # No DB writes
-        assert not any(
-            "INSERT" in c.args[0]
-            for c in mock_cursor.execute.call_args_list
         )
 
-    def test_self_sent_check_case_insensitive(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
+    def test_insert_with_status_bump_on_rejection(
+        self, monkeypatch, mock_cursor, mock_conn
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-
-        msg = _make_message(from_addr="USER@GMAIL.COM")
-        outcome = gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-        assert outcome == "skipped:self_sent"
-
-    def test_inserted_response_with_archive(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
-    ):
-        _set_env(monkeypatch)
-        gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller)
-
-        mock_cursor.rowcount = 1  # INSERT IGNORE inserted
-
-        msg = _make_message(
-            subject="Update on your application",
-            body_text="Unfortunately we won't be moving forward.",
-        )
-
-        outcome = gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-
-        assert outcome == "inserted"
-        insert_calls = [
-            c for c in mock_cursor.execute.call_args_list
-            if "INSERT IGNORE INTO responses" in c.args[0]
-        ]
-        assert len(insert_calls) == 1
-        # Check the params include the gmail_message_id and the s3_key
-        params = insert_calls[0].args[1]
-        assert params[0] == 7  # submission_id
-        assert params[1] == _classifications_map()["rejection"]
-        assert params[3] == "recruiter@acme.com"  # from_email
-        assert params[6] == "42/msg-1.eml"  # s3_key
-        assert params[7] == "msg-1"  # gmail_message_id
-
-    def test_status_bump_on_rejection(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
-    ):
-        _set_env(monkeypatch)
-        gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller)
-
         mock_cursor.rowcount = 1
 
-        msg = _make_message(
-            body_text="Unfortunately we won't be moving forward."
-        )
-
-        gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "inserted"
 
         update_calls = [
             c for c in mock_cursor.execute.call_args_list
             if "UPDATE submissions SET submission_status_id" in c.args[0]
         ]
         assert len(update_calls) == 1
-        params = update_calls[0].args[1]
-        assert params[0] == _statuses_map()["rejected"]
-        assert params[1] == 7
-        assert params[2] == 42
+        assert update_calls[0].args[1][0] == _statuses_map()["rejected"]
 
-    def test_status_bump_on_interview_invite(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
+    def test_insert_with_status_bump_on_interview_invite(
+        self, monkeypatch, mock_cursor, mock_conn
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller)
-
         mock_cursor.rowcount = 1
 
-        msg = _make_message(
-            body_text="Let's schedule a call next week to discuss."
+        outcome = self._call(
+            gmail_poller, conn=mock_conn,
+            classification_short="interview_invite",
         )
-
-        gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-
+        assert outcome == "inserted"
         update_calls = [
             c for c in mock_cursor.execute.call_args_list
             if "UPDATE submissions SET submission_status_id" in c.args[0]
@@ -399,103 +315,388 @@ class TestProcessMessage:
         assert len(update_calls) == 1
         assert update_calls[0].args[1][0] == _statuses_map()["interviewing"]
 
-    def test_no_status_bump_on_other(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
+    def test_insert_no_bump_on_other(
+        self, monkeypatch, mock_cursor, mock_conn
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller)
-
         mock_cursor.rowcount = 1
 
-        msg = _make_message(
-            subject="Quick question",
-            body_text="Just checking in.",
-        )
-
-        gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-
+        self._call(gmail_poller, conn=mock_conn, classification_short="other")
         update_calls = [
             c for c in mock_cursor.execute.call_args_list
             if "UPDATE submissions SET submission_status_id" in c.args[0]
         ]
         assert len(update_calls) == 0
 
-    def test_idempotent_skip_on_existing_message(
-        self, mocker, monkeypatch, mock_cursor, mock_conn
+    def test_skipped_exists_when_unique_key_matches(
+        self, monkeypatch, mock_cursor, mock_conn
     ):
-        # rowcount=0 from INSERT IGNORE means duplicate — skip status bump.
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller)
+        mock_cursor.rowcount = 0  # INSERT IGNORE matched the unique key
 
-        mock_cursor.rowcount = 0
-
-        msg = _make_message(
-            body_text="Unfortunately we won't be moving forward."
-        )
-
-        outcome = gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
-        )
-
+        outcome = self._call(gmail_poller, conn=mock_conn)
         assert outcome == "skipped:exists"
-        # No status bump for already-existing rows
         update_calls = [
             c for c in mock_cursor.execute.call_args_list
             if "UPDATE submissions SET submission_status_id" in c.args[0]
         ]
         assert len(update_calls) == 0
 
-    def test_archive_failure_does_not_block_insert(
+
+# ---------------------------------------------------------------------------
+# _insert_contact_outreach_row
+# ---------------------------------------------------------------------------
+
+
+class TestInsertContactOutreachRow:
+    def _call(
+        self, gmail_poller, *, conn, msg_id="msg-1",
+    ):
+        from datetime import datetime, timezone
+
+        return gmail_poller._insert_contact_outreach_row(
+            conn=conn,
+            user_id=42,
+            contact_id=11,
+            msg_id=msg_id,
+            thread_id="thread-abc",
+            received_at=datetime(2024, 5, 2, tzinfo=timezone.utc),
+            from_email="maria@coldoutreach.com",
+            subject="Re: Quick intro",
+            body_text="Sounds great!",
+            email_method_id=EMAIL_METHOD_ID,
+            inbound_direction_id=INBOUND_DIRECTION_ID,
+        )
+
+    def test_inserts_row_with_expected_params(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        mock_cursor.rowcount = 1
+
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "inserted"
+
+        inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+        ]
+        assert len(inserts) == 1
+        params = inserts[0].args[1]
+        # (user_id, contact_id, received_at, method_id, direction_id,
+        #  thread_id, gmail_message_id, subject, body_text, from_email)
+        assert params[0] == 42
+        assert params[1] == 11
+        assert params[3] == EMAIL_METHOD_ID
+        assert params[4] == INBOUND_DIRECTION_ID
+        assert params[5] == "thread-abc"
+        assert params[6] == "msg-1"
+        assert params[7] == "Re: Quick intro"
+        assert params[8] == "Sounds great!"
+        assert params[9] == "maria@coldoutreach.com"
+
+    def test_skipped_exists_when_unique_key_matches(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        mock_cursor.rowcount = 0
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "skipped:exists"
+
+
+# ---------------------------------------------------------------------------
+# _archive_raw — fan-out shared between both write paths
+# ---------------------------------------------------------------------------
+
+
+class TestArchive:
+    def test_returns_s3_key_on_success(self, mocker, monkeypatch):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        fake_s3 = MagicMock()
+        mocker.patch.object(gmail_poller, "_get_s3", return_value=fake_s3)
+
+        execute = MagicMock(return_value={"raw": "cmF3IGJ5dGVz"})
+        get_call = MagicMock(return_value=MagicMock(execute=execute))
+        messages = MagicMock(get=get_call)
+        users = MagicMock(messages=MagicMock(return_value=messages))
+        service = MagicMock(users=MagicMock(return_value=users))
+
+        s3_key = gmail_poller._archive_raw(
+            service=service, user_id=42, msg_id="msg-1",
+            archive_bucket="bucket",
+        )
+        assert s3_key == "42/msg-1.eml"
+        fake_s3.put_object.assert_called_once()
+
+    def test_returns_none_on_failure(self, mocker, monkeypatch):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        fake_s3 = MagicMock()
+        fake_s3.put_object.side_effect = RuntimeError("boom")
+        mocker.patch.object(gmail_poller, "_get_s3", return_value=fake_s3)
+
+        execute = MagicMock(return_value={"raw": "cmF3IGJ5dGVz"})
+        get_call = MagicMock(return_value=MagicMock(execute=execute))
+        messages = MagicMock(get=get_call)
+        users = MagicMock(messages=MagicMock(return_value=messages))
+        service = MagicMock(users=MagicMock(return_value=users))
+
+        assert gmail_poller._archive_raw(
+            service=service, user_id=42, msg_id="msg-1",
+            archive_bucket="bucket",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# _process_thread — dual-write orchestration
+# ---------------------------------------------------------------------------
+
+
+class TestProcessThread:
+    """Exercises the dual-write per-message logic.
+
+    The thread anchors are resolved via two SELECTs (submissions list +
+    most-recent contact_id). Tests configure ``mock_cursor.fetchall`` /
+    ``fetchone`` via ``side_effect`` to simulate each anchor scenario.
+    """
+
+    def _common_kwargs(self, gmail_poller, *, mock_conn, mocker, messages):
+        # S3 archive succeeds and returns a key.
+        mocker.patch.object(
+            gmail_poller, "_archive_raw",
+            return_value="42/msg-id.eml",
+        )
+        return {
+            "conn": mock_conn,
+            "service": _service_with_thread(messages),
+            "user_id": 42,
+            "thread_id": "thread-abc",
+            "gmail_address": "user@gmail.com",
+            "classifications": _classifications_map(),
+            "statuses": _statuses_map(),
+            "email_method_id": EMAIL_METHOD_ID,
+            "inbound_direction_id": INBOUND_DIRECTION_ID,
+            "archive_bucket": "bucket",
+        }
+
+    def test_thread_with_no_anchors_skipped(
         self, mocker, monkeypatch, mock_cursor, mock_conn
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-        self._patch_archive(mocker, gmail_poller, succeed=False)
 
-        mock_cursor.rowcount = 1
+        # No submissions, no contact_outreach rows.
+        mock_cursor.fetchall.side_effect = [[]]
+        mock_cursor.fetchone.return_value = None
 
         msg = _make_message()
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+        # Nothing inserted because there are no anchors.
+        assert counters.get("responses_inserted", 0) == 0
+        assert counters.get("contact_outreach_inserted", 0) == 0
 
-        outcome = gmail_poller._process_message(
-            conn=mock_conn,
-            service=self._service_with_raw(mocker),
-            user_id=42,
-            submission_id=7,
-            msg=msg,
-            gmail_address="user@gmail.com",
-            classifications=_classifications_map(),
-            statuses=_statuses_map(),
-            archive_bucket="bucket",
+    def test_submission_only_thread(
+        self, mocker, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        # _resolve_thread_anchors: fetchall → submissions, fetchone → contact.
+        mock_cursor.fetchall.side_effect = [[{"id": 7}]]
+        mock_cursor.fetchone.return_value = None
+        mock_cursor.rowcount = 1  # All inserts succeed
+
+        msg = _make_message(
+            subject="Update", body_text="Unfortunately we won't be moving forward."
+        )
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+
+        assert counters["responses_inserted"] == 1
+        assert counters.get("contact_outreach_inserted", 0) == 0
+
+        co_inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 0
+
+    def test_contact_only_thread(
+        self, mocker, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        # No submissions; contact 11 is the most-recent.
+        mock_cursor.fetchall.side_effect = [[]]
+        mock_cursor.fetchone.return_value = {"contact_id": 11}
+        mock_cursor.rowcount = 1
+
+        msg = _make_message(
+            subject="Re: intro", body_text="Sounds great, let's chat."
+        )
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+
+        assert counters.get("responses_inserted", 0) == 0
+        assert counters["contact_outreach_inserted"] == 1
+
+        co_inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 1
+        assert co_inserts[0].args[1][1] == 11  # contact_id
+
+        # No status-bump UPDATE in the contact-only path.
+        assert not any(
+            "UPDATE submissions SET submission_status_id" in c.args[0]
+            for c in mock_cursor.execute.call_args_list
         )
 
-        assert outcome == "inserted"
-        # The insert ran with s3_key=None (archive failed)
-        insert_calls = [
-            c for c in mock_cursor.execute.call_args_list
-            if "INSERT IGNORE INTO responses" in c.args[0]
+    def test_thread_mapped_to_both(
+        self, mocker, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        # Submission 7 + most-recent contact 11.
+        mock_cursor.fetchall.side_effect = [[{"id": 7}]]
+        mock_cursor.fetchone.return_value = {"contact_id": 11}
+        mock_cursor.rowcount = 1
+
+        msg = _make_message(
+            subject="Re: Application", body_text="Let's schedule a call."
+        )
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+
+        assert counters["responses_inserted"] == 1
+        assert counters["contact_outreach_inserted"] == 1
+
+    def test_self_sent_message_skipped(
+        self, mocker, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        mock_cursor.fetchall.side_effect = [[{"id": 7}]]
+        mock_cursor.fetchone.return_value = {"contact_id": 11}
+
+        msg = _make_message(from_addr='"Me" <USER@gmail.com>')
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+
+        assert counters["skipped:self_sent"] == 1
+        assert counters.get("responses_inserted", 0) == 0
+        assert counters.get("contact_outreach_inserted", 0) == 0
+
+    def test_idempotent_rerun_skips_existing_rows(
+        self, mocker, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        mock_cursor.fetchall.side_effect = [[{"id": 7}]]
+        mock_cursor.fetchone.return_value = {"contact_id": 11}
+        mock_cursor.rowcount = 0  # INSERT IGNORE matched on every write
+
+        msg = _make_message()
+        kwargs = self._common_kwargs(
+            gmail_poller, mock_conn=mock_conn, mocker=mocker, messages=[msg]
+        )
+        counters = gmail_poller._process_thread(**kwargs)
+
+        assert counters.get("responses_inserted", 0) == 0
+        assert counters["responses_skipped:exists"] == 1
+        assert counters.get("contact_outreach_inserted", 0) == 0
+        assert counters["contact_outreach_skipped:exists"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _resolve_thread_anchors — multi-contact most-recent (Fork 1)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveThreadAnchors:
+    def test_returns_most_recent_contact(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        # The SQL is `ORDER BY outreach_at DESC LIMIT 1`, so the test
+        # only needs to assert that the cursor returns whatever the
+        # query yields. The "multi-contact" semantics live in the SQL
+        # itself; here we verify the function plumbs it through.
+        mock_cursor.fetchall.return_value = [{"id": 7}, {"id": 12}]
+        mock_cursor.fetchone.return_value = {"contact_id": 11}
+
+        sub_ids, contact_id = gmail_poller._resolve_thread_anchors(
+            mock_conn, user_id=42, thread_id="thread-abc"
+        )
+        assert sub_ids == [7, 12]
+        assert contact_id == 11
+
+    def test_no_anchors(self, monkeypatch, mock_cursor, mock_conn):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        mock_cursor.fetchall.return_value = []
+        mock_cursor.fetchone.return_value = None
+
+        sub_ids, contact_id = gmail_poller._resolve_thread_anchors(
+            mock_conn, user_id=42, thread_id="thread-abc"
+        )
+        assert sub_ids == []
+        assert contact_id is None
+
+
+# ---------------------------------------------------------------------------
+# _enumerate_thread_ids — UNION of submissions ∪ contact_outreach
+# ---------------------------------------------------------------------------
+
+
+class TestEnumerateThreadIds:
+    def test_returns_distinct_thread_ids_from_both_sources(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+
+        mock_cursor.fetchall.return_value = [
+            {"thread_id": "thread-sub-only"},
+            {"thread_id": "thread-contact-only"},
+            {"thread_id": "thread-both"},
         ]
-        params = insert_calls[0].args[1]
-        assert params[6] is None  # raw_email_s3_key
+
+        thread_ids = gmail_poller._enumerate_thread_ids(mock_conn, user_id=42)
+        assert thread_ids == [
+            "thread-sub-only",
+            "thread-contact-only",
+            "thread-both",
+        ]
+
+        sql = mock_cursor.execute.call_args.args[0]
+        assert "FROM submissions" in sql
+        assert "FROM contact_outreach" in sql
+        assert "UNION" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -504,30 +705,8 @@ class TestProcessMessage:
 
 
 class TestHandler:
-    def _patch_googley_bits(self, mocker, gmail_poller):
-        from common import gmail_client
-
-        fake_kms = MagicMock()
-        fake_kms.decrypt.return_value = {"Plaintext": b"decrypted-token"}
-        mocker.patch.object(gmail_client, "_get_kms_client", return_value=fake_kms)
-
-        fake_ssm = MagicMock()
-        fake_ssm.get_parameter.return_value = {
-            "Parameter": {
-                "Value": json.dumps(
-                    {"client_id": "cid", "client_secret": "csec"}
-                )
-            }
-        }
-        mocker.patch.object(gmail_poller, "_get_ssm", return_value=fake_ssm)
-
-        mocker.patch.object(gmail_poller, "build_credentials", return_value=MagicMock())
-        # `service` must support the chain users().threads().get(...).execute()
-        # AND users().messages().get(...).execute() (for the raw fetch).
-        return mocker.patch.object(gmail_poller, "build_gmail_service")
-
     def test_no_active_users_exits_clean(
-        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+        self, monkeypatch, lambda_ctx, mock_cursor, patched_conn
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
@@ -540,9 +719,7 @@ class TestHandler:
         assert out["users_processed"] == 0
         assert out["users_failed"] == 0
 
-    def test_misconfigured_env_returns_error(
-        self, mocker, monkeypatch, lambda_ctx
-    ):
+    def test_misconfigured_env_returns_error(self, monkeypatch, lambda_ctx):
         # Don't set the env vars — trigger the early misconfigured check.
         monkeypatch.delenv("GMAIL_KMS_KEY_ID", raising=False)
         monkeypatch.delenv("GMAIL_ARCHIVE_BUCKET", raising=False)

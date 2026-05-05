@@ -998,7 +998,8 @@ export default function SubmissionDetail() {
         <GmailComposeModal
           show={true}
           onHide={() => setComposeOpen(null)}
-          submissionId={Number(id)}
+          defaultSubmissionId={Number(id)}
+          defaultContactId={null}
           replyTo={composeOpen.replyTo}
           defaultResumeId={data.resume_id ?? null}
           onSent={() => {

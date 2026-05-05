@@ -19,8 +19,13 @@ export default function Settings() {
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
 
   // Detect post-OAuth redirect query params and surface to the user.
-  const oauthSuccess = searchParams.get('gmail_connected') === '1';
-  const oauthError = searchParams.get('gmail_error');
+  // Capture into state on mount so banners survive the URL strip below
+  // (a derived `searchParams.get(...)` would flip to null on the
+  // post-strip re-render, blanking the banner before the user sees it).
+  const [oauthSuccess] = useState(
+    searchParams.get('gmail_connected') === '1',
+  );
+  const [oauthError] = useState(searchParams.get('gmail_error'));
 
   useEffect(() => {
     if (oauthSuccess || oauthError) {

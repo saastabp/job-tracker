@@ -224,9 +224,62 @@ def test_detail_with_outreach_timeline(
     assert len(body["outreach"]) == 2
     assert body["outreach"][0]["method"] == "email"
     assert body["outreach"][0]["direction"] == "outbound"
+    # Manually-logged rows surface the new email-shaped fields as null,
+    # not absent — so the SPA's per-row branching can rely on them.
+    assert body["outreach"][0]["subject"] is None
+    assert body["outreach"][0]["body_text"] is None
+    assert body["outreach"][0]["from_email"] is None
+    assert body["outreach"][0]["gmail_thread_id"] is None
+    assert body["outreach"][0]["gmail_message_id"] is None
     assert body["linked_submissions"] == [
         {"id": 42, "role_title": "SRE", "company_name": "Acme", "status": "applied"},
     ]
+
+
+def test_detail_with_email_sourced_outreach(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """Email-sourced contact_outreach rows surface subject/body/from_email/thread/msg ids."""
+    from handlers import contacts
+
+    patched_conn("handlers.contacts")
+    mocker.patch("handlers.contacts.get_user_id", return_value=42)
+
+    mock_cursor.fetchone.return_value = {
+        "id": 1, "name": "Jane", "email": "jane@x.com", "linkedin_url": None,
+        "notes": None, "company_id": None, "company_name": None,
+        "kind": "recruiter", "primary_method": "email",
+        "outreach_count": 1, "last_outreach_at": "2026-05-01 12:00:00",
+    }
+    mock_cursor.fetchall.side_effect = [
+        [
+            {
+                "id": 21, "outreach_at": "2026-05-01 12:00:00",
+                "method": "email", "direction": "inbound",
+                "notes": None,
+                "subject": "Re: Quick intro",
+                "body_text": "Sounds great — let's set up a call.",
+                "from_email": "jane@x.com",
+                "gmail_thread_id": "thread-abc",
+                "gmail_message_id": "msg-xyz",
+            },
+        ],
+        [],  # linked_submissions
+    ]
+
+    resp = contacts.handler(
+        auth_event("GET /contacts/{id}", path_id="1"),
+        lambda_ctx,
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    evt = body["outreach"][0]
+    assert evt["subject"] == "Re: Quick intro"
+    assert evt["body_text"] == "Sounds great — let's set up a call."
+    assert evt["from_email"] == "jane@x.com"
+    assert evt["gmail_thread_id"] == "thread-abc"
+    assert evt["gmail_message_id"] == "msg-xyz"
+    assert evt["direction"] == "inbound"
 
 
 def test_detail_not_found_returns_404(

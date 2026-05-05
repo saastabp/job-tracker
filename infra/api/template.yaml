@@ -670,10 +670,13 @@ Resources:
             Path: /submissions/{id}/gmail-link
             Method: DELETE
 
-  # Gmail compose function — POST /submissions/{id}/send. Sends a new
-  # message (compose mode) or replies to an existing one (reply mode)
-  # via the Gmail API. Optional resume PDF attachment fetched from the
-  # resume S3 bucket. Conditional on the gmail stack being deployed.
+  # Gmail compose function — POST /messages/send. Sends a new message
+  # (compose mode) or replies to an existing one (reply mode) via the
+  # Gmail API. Body carries submission_id? and contact_id? — at least
+  # one is required; both can be set, in which case the submission is
+  # linked AND a contact_outreach row is inserted in one transaction.
+  # Optional resume PDF attachment fetched from the resume S3 bucket.
+  # Conditional on the gmail stack being deployed.
   GmailComposeFunction:
     Type: AWS::Serverless::Function
     Condition: HasGmail
@@ -716,7 +719,7 @@ Resources:
           Type: HttpApi
           Properties:
             ApiId: !Ref HttpApi
-            Path: /submissions/{id}/send
+            Path: /messages/send
             Method: POST
 
   PostConfirmationCognitoPermission:

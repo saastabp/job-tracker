@@ -8,9 +8,13 @@ import {
   Table,
   Row,
   Col,
+  Badge,
+  Collapse,
 } from 'react-bootstrap';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../api/client';
+import { hasSendScope, useGmailStatus } from '../api/gmail';
+import GmailComposeModal from '../components/GmailComposeModal';
 import { KindBadge } from './Contacts';
 import { KINDS, METHODS, DIRECTIONS } from './ContactForm';
 import { StatusBadge } from './Submissions';
@@ -21,6 +25,11 @@ interface OutreachEvent {
   method: string | null;
   direction: string;
   notes: string | null;
+  subject: string | null;
+  body_text: string | null;
+  from_email: string | null;
+  gmail_thread_id: string | null;
+  gmail_message_id: string | null;
 }
 
 interface LinkedSubmission {
@@ -57,10 +66,6 @@ function methodLabel(m: string | null): string {
   return METHODS.find((x) => x.short_name === m)?.label ?? m;
 }
 
-function directionLabel(d: string): string {
-  return DIRECTIONS.find((x) => x.short_name === d)?.label ?? d;
-}
-
 export default function ContactDetail() {
   const apiFetch = useApi();
   const navigate = useNavigate();
@@ -84,6 +89,13 @@ export default function ContactDetail() {
   const [outAt, setOutAt] = useState('');
   const [outNotes, setOutNotes] = useState('');
   const [logging, setLogging] = useState(false);
+
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [expandedEventIds, setExpandedEventIds] = useState<Set<number>>(
+    new Set(),
+  );
+  const { status: gmailStatus } = useGmailStatus();
+  const sendEnabled = hasSendScope(gmailStatus);
 
   const load = useCallback(async () => {
     try {
@@ -195,6 +207,15 @@ export default function ContactDetail() {
     }
   }
 
+  function toggleEventExpanded(eventId: number) {
+    setExpandedEventIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(eventId)) next.delete(eventId);
+      else next.add(eventId);
+      return next;
+    });
+  }
+
   if (error && !data) return <Alert variant="danger">{error}</Alert>;
   if (!data) return <Spinner animation="border" size="sm" />;
 
@@ -206,6 +227,16 @@ export default function ContactDetail() {
         </Link>
         <h3 className="mb-0 me-2">{data.name}</h3>
         <KindBadge kind={data.kind} />
+        {sendEnabled && (
+          <Button
+            size="sm"
+            variant="primary"
+            className="ms-auto"
+            onClick={() => setComposeOpen(true)}
+          >
+            Compose email
+          </Button>
+        )}
       </div>
 
       {error && <Alert variant="danger">{error}</Alert>}
@@ -390,38 +421,97 @@ export default function ContactDetail() {
           </Card.Body>
         </Card>
       ) : (
-        <Table hover responsive className="align-middle">
-          <thead>
-            <tr>
-              <th>When</th>
-              <th>Direction</th>
-              <th>Method</th>
-              <th>Notes</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.outreach.map((evt) => (
-              <tr key={evt.id}>
-                <td>{evt.outreach_at ?? '—'}</td>
-                <td>{directionLabel(evt.direction)}</td>
-                <td>{methodLabel(evt.method)}</td>
-                <td className="text-truncate" style={{ maxWidth: 360 }}>
-                  {evt.notes ?? ''}
-                </td>
-                <td className="text-end">
-                  <Button
-                    variant="link"
-                    size="sm"
-                    onClick={() => handleDeleteOutreach(evt.id)}
+        <Card className="mb-3">
+          <Card.Body className="p-0">
+            <ul className="list-unstyled mb-0">
+              {data.outreach.map((evt) => {
+                const isEmail = Boolean(evt.gmail_message_id);
+                const hasBody = Boolean(evt.body_text && evt.body_text.length > 0);
+                const isExpanded = expandedEventIds.has(evt.id);
+                const arrow = evt.direction === 'inbound' ? '↓' : '↑';
+                const arrowVariant =
+                  evt.direction === 'inbound' ? 'success' : 'primary';
+                const headline = isEmail
+                  ? evt.subject || '(no subject)'
+                  : evt.notes || '(no notes)';
+                return (
+                  <li
+                    key={evt.id}
+                    className="px-3 py-2 border-bottom"
                   >
-                    Delete
-                  </Button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </Table>
+                    <div className="d-flex align-items-center gap-2">
+                      <Badge bg={arrowVariant} pill title={evt.direction}>
+                        {arrow}
+                      </Badge>
+                      {evt.method && (
+                        <Badge bg="secondary">{methodLabel(evt.method)}</Badge>
+                      )}
+                      {isEmail && (
+                        <Badge bg="info" text="dark">
+                          via Gmail
+                        </Badge>
+                      )}
+                      <span className="flex-grow-1">
+                        {hasBody ? (
+                          <Button
+                            variant="link"
+                            size="sm"
+                            className="p-0 align-baseline text-start text-decoration-none"
+                            onClick={() => toggleEventExpanded(evt.id)}
+                          >
+                            <span className="me-1">
+                              {isExpanded ? '▾' : '▸'}
+                            </span>
+                            {headline}
+                          </Button>
+                        ) : (
+                          <span>{headline}</span>
+                        )}
+                        {evt.from_email && (
+                          <span className="text-muted small ms-2">
+                            from {evt.from_email}
+                          </span>
+                        )}
+                        {evt.outreach_at && (
+                          <span className="text-muted small ms-2">
+                            {evt.outreach_at}
+                          </span>
+                        )}
+                      </span>
+                      <Button
+                        variant="link"
+                        size="sm"
+                        onClick={() => handleDeleteOutreach(evt.id)}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                    {isEmail && evt.notes && (
+                      <div className="text-muted small ms-4 mt-1">
+                        {evt.notes}
+                      </div>
+                    )}
+                    <Collapse in={isExpanded && hasBody}>
+                      <div>
+                        <pre
+                          className="small text-muted mt-2 mb-0 ms-4 p-2 bg-light rounded"
+                          style={{
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            maxHeight: 400,
+                            overflowY: 'auto',
+                          }}
+                        >
+                          {evt.body_text}
+                        </pre>
+                      </div>
+                    </Collapse>
+                  </li>
+                );
+              })}
+            </ul>
+          </Card.Body>
+        </Card>
       )}
 
       <h5 className="mt-4">
@@ -459,6 +549,25 @@ export default function ContactDetail() {
             ))}
           </tbody>
         </Table>
+      )}
+
+      {composeOpen && (
+        <GmailComposeModal
+          show={true}
+          onHide={() => setComposeOpen(false)}
+          defaultSubmissionId={null}
+          defaultContactId={data.id}
+          contactBannerLabel={data.name}
+          defaultTo={data.email ?? ''}
+          defaultResumeId={null}
+          onSent={() => {
+            setComposeOpen(false);
+            load();
+          }}
+          onNeedReconsent={() => {
+            window.location.href = '/settings';
+          }}
+        />
       )}
     </>
   );

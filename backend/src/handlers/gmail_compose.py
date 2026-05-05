@@ -1,23 +1,44 @@
-"""POST /submissions/{id}/send — compose / send / reply via Gmail.
+"""POST /messages/send — unified compose / reply via Gmail.
 
-One route, one Lambda. Two modes:
+One route, one Lambda. Three anchor combinations land here:
+
+* **Submission-only** (``submission_id`` set, ``contact_id`` null): the
+  slice-9 path. Email links a submission to a Gmail thread.
+
+* **Contact-only** (``contact_id`` set, ``submission_id`` null): outreach
+  to a contact who isn't (yet) tied to a specific role. The outbound
+  message is logged as a ``contact_outreach`` row (direction=outbound,
+  method=email) carrying subject/body/gmail_thread_id/gmail_message_id
+  so the contact-detail timeline can render the conversation.
+
+* **Both** (``submission_id`` and ``contact_id`` set): "applying for
+  this role via this recruiter." Two writes happen — the submission's
+  thread_id is set, AND a contact_outreach row is inserted — within a
+  single DB transaction.
+
+At least one anchor is required; rejecting an unanchored send is the
+locked decision (Fork 4) per the slice-10 plan: if you compose from
+inside the app, you want the interaction tracked. The handler returns
+``{thread_id, gmail_message_id}`` regardless of which anchors fired.
+
+Two modes (orthogonal to the anchor question):
 
 * **Compose mode** (``in_reply_to_message_id`` absent in body)
-    Submission must NOT yet have a ``gmail_thread_id``. The handler
-    sends a fresh message; Gmail creates a new thread and returns its
-    ``threadId``, which is written onto the submission. The user's
-    send becomes the seed for the inbound poller.
+    Submission (when present) must NOT yet have a ``gmail_thread_id``.
+    The handler sends a fresh message; Gmail creates a new thread and
+    returns its ``threadId``, which is written onto the submission and
+    carried into the contact_outreach insert.
 
 * **Reply mode** (``in_reply_to_message_id`` present)
-    Submission MUST have a ``gmail_thread_id`` (i.e. either previously
-    sent via the app or manually linked via the admin handler). The
-    handler fetches the original message's RFC 822 ``Message-ID`` and
+    Submission MUST be present AND have a ``gmail_thread_id`` (i.e.
+    either previously sent via the app or manually linked via the
+    admin handler). Contact-only reply (``contact_id`` set, no
+    ``submission_id``) is rejected — slice-10 v1 doesn't support it;
+    user creates a submission and links the thread first. The handler
+    fetches the original message's RFC 822 ``Message-ID`` and
     ``References`` headers, builds proper threading headers
     (``In-Reply-To``, ``References``), and passes ``threadId`` in the
-    send request as a belt-and-suspenders check alongside the
-    headers. Gmail will reject the send if the ``threadId`` doesn't
-    match what ``In-Reply-To`` resolves to, catching cross-thread
-    bugs.
+    send request as a belt-and-suspenders check alongside the headers.
 
 Plaintext body only — slice 09 locked decision (no rich text, no
 multipart/alternative). Optional resume attachment: ``resume_id``
@@ -83,16 +104,6 @@ def _response(status: int, body: Any) -> dict[str, Any]:
     }
 
 
-def _path_id(event: dict[str, Any], key: str = "id") -> int:
-    raw = (event.get("pathParameters") or {}).get(key)
-    if raw is None:
-        raise ValueError(f"missing path parameter: {key}")
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid {key}: {raw!r}")
-
-
 def _get_oauth_client_credentials() -> tuple[str, str]:
     response = _get_ssm().get_parameter(
         Name=GMAIL_OAUTH_CLIENT_SSM_PATH, WithDecryption=True
@@ -114,6 +125,28 @@ def _normalize_recipients(value: Any) -> list[str]:
     return []
 
 
+def _coerce_optional_int(value: Any, name: str) -> int | None:
+    """Accept None, an int, or a numeric string; return int or None.
+
+    Reject anything else with ``ValueError``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool is an int subclass; reject explicitly
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer")
+    raise ValueError(f"{name} must be an integer")
+
+
 def _validate_body(body: dict[str, Any]) -> dict[str, Any]:
     to = _normalize_recipients(body.get("to"))
     if not to:
@@ -127,6 +160,11 @@ def _validate_body(body: dict[str, Any]) -> dict[str, Any]:
     if not body_text.strip():
         raise ValueError("body is required")
 
+    submission_id = _coerce_optional_int(body.get("submission_id"), "submission_id")
+    contact_id = _coerce_optional_int(body.get("contact_id"), "contact_id")
+    if submission_id is None and contact_id is None:
+        raise ValueError("submission_id or contact_id is required")
+
     return {
         "to": to,
         "cc": _normalize_recipients(body.get("cc") or []),
@@ -135,6 +173,8 @@ def _validate_body(body: dict[str, Any]) -> dict[str, Any]:
         "body": body_text,
         "resume_id": body.get("resume_id"),
         "in_reply_to_message_id": body.get("in_reply_to_message_id"),
+        "submission_id": submission_id,
+        "contact_id": contact_id,
     }
 
 
@@ -247,6 +287,19 @@ def _build_mime(
     return msg
 
 
+def _catalog_id(conn: Any, table: str, short_name: str) -> int:
+    """Look up a catalog row's id by short_name. Raises if missing."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT id FROM {table} WHERE short_name = %s AND deleted_at IS NULL",
+            (short_name,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"{table}.short_name='{short_name}' not found")
+    return int(row["id"])
+
+
 def _send(
     *,
     conn: Any,
@@ -254,7 +307,6 @@ def _send(
     gmail_address: str,
     refresh_token_ciphertext: bytes,
     scopes: str,
-    submission_id: int,
     body: dict[str, Any],
 ) -> dict[str, Any]:
     """Orchestrate validation → send → persist. Returns ``{thread_id, gmail_message_id}``.
@@ -264,11 +316,13 @@ def _send(
     ValueError
         Bad input (missing fields, mode mismatch, no PDF on the resume).
     LookupError
-        Submission or resume not found / not owned.
+        Submission, contact, or resume not found / not owned.
     _ScopeError
         ``gmail.send`` missing from credential scopes.
     """
     validated = _validate_body(body)
+    submission_id = validated["submission_id"]
+    contact_id = validated["contact_id"]
 
     scope_list = scopes.split() if scopes else []
     if GMAIL_SEND_SCOPE not in scope_list:
@@ -286,23 +340,45 @@ def _send(
     )
     service = build_gmail_service(credentials)
 
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, gmail_thread_id FROM submissions "
-            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
-            (submission_id, user_id),
-        )
-        sub_row = cur.fetchone()
-    if not sub_row:
-        raise LookupError("submission not found")
-    current_thread_id = sub_row["gmail_thread_id"]
+    # Anchor lookups: ownership-check whichever of submission_id /
+    # contact_id were provided. Both are optional; at least one was
+    # validated above.
+    current_thread_id: str | None = None
+    if submission_id is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, gmail_thread_id FROM submissions "
+                "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+                (submission_id, user_id),
+            )
+            sub_row = cur.fetchone()
+        if not sub_row:
+            raise LookupError("submission not found")
+        current_thread_id = sub_row["gmail_thread_id"]
+
+    if contact_id is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM contacts "
+                "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+                (contact_id, user_id),
+            )
+            con_row = cur.fetchone()
+        if not con_row:
+            raise LookupError("contact not found")
 
     in_reply_to_msg_id = validated["in_reply_to_message_id"]
     in_reply_to_rfc = ""
     references_chain = ""
 
     if in_reply_to_msg_id:
-        # Reply mode
+        # Reply mode requires a submission anchor with a linked thread.
+        # Slice-10 v1 doesn't support reply-against-contact-only-thread.
+        if submission_id is None:
+            raise ValueError(
+                "reply requires submission_id; reply-from-contact-only "
+                "thread is not supported"
+            )
         if not current_thread_id:
             raise ValueError(
                 "cannot reply: submission has no linked thread"
@@ -321,8 +397,8 @@ def _send(
         else:
             references_chain = original_rfc
     else:
-        # Compose mode
-        if current_thread_id:
+        # Compose mode: submission (if anchored) must not already be linked.
+        if submission_id is not None and current_thread_id:
             raise ValueError(
                 "submission already linked to a thread; use reply mode"
             )
@@ -356,6 +432,7 @@ def _send(
         extra={
             "user_id": user_id,
             "submission_id": submission_id,
+            "contact_id": contact_id,
             "mode": "reply" if in_reply_to_msg_id else "compose",
             "has_attachment": pdf_bytes is not None,
             "to_count": len(validated["to"]),
@@ -372,36 +449,72 @@ def _send(
     sent_id = result["id"]
     returned_thread_id = result["threadId"]
 
-    if not current_thread_id:
-        # Compose mode: persist the thread_id Gmail just generated.
-        with conn.cursor() as cur:
+    if current_thread_id and current_thread_id != returned_thread_id:
+        # Reply mode mismatch — Gmail's threadId guard should have rejected
+        # the send before we got here. If not, something is very wrong.
+        raise RuntimeError(
+            f"thread_id mismatch: stored={current_thread_id} "
+            f"returned={returned_thread_id}"
+        )
+
+    # Persistence — both writes (when both anchors are present) happen in
+    # the same transaction so the row + thread_id update either both land
+    # or neither does.
+    with conn.cursor() as cur:
+        if submission_id is not None and not current_thread_id:
             cur.execute(
                 "UPDATE submissions SET gmail_thread_id = %s "
                 "WHERE id = %s AND user_id = %s",
                 (returned_thread_id, submission_id, user_id),
             )
-            conn.commit()
-        logger.info(
-            "gmail_compose: thread linked from send",
-            extra={
-                "submission_id": submission_id,
-                "thread_id": returned_thread_id,
-            },
-        )
-    elif current_thread_id != returned_thread_id:
-        # Reply mode mismatch — Gmail's threadId guard should have
-        # rejected the send before we got here. If not, something is
-        # very wrong.
-        raise RuntimeError(
-            f"thread_id mismatch: stored={current_thread_id} "
-            f"returned={returned_thread_id}"
-        )
+            logger.info(
+                "gmail_compose: thread linked from send",
+                extra={
+                    "submission_id": submission_id,
+                    "thread_id": returned_thread_id,
+                },
+            )
+
+        if contact_id is not None:
+            outbound_id = _catalog_id(conn, "outreach_directions", "outbound")
+            email_method_id = _catalog_id(conn, "outreach_methods", "email")
+            cur.execute(
+                """
+                INSERT INTO contact_outreach
+                    (user_id, contact_id, outreach_at,
+                     outreach_method_id, outreach_direction_id,
+                     gmail_thread_id, gmail_message_id,
+                     subject, body_text, from_email)
+                VALUES (%s, %s, CURRENT_TIMESTAMP,
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s)
+                """,
+                (
+                    user_id, contact_id,
+                    email_method_id, outbound_id,
+                    returned_thread_id, sent_id,
+                    validated["subject"][:998],
+                    validated["body"],
+                    gmail_address,
+                ),
+            )
+            logger.info(
+                "gmail_compose: contact_outreach row inserted",
+                extra={
+                    "contact_id": contact_id,
+                    "thread_id": returned_thread_id,
+                    "gmail_message_id": sent_id,
+                },
+            )
+    conn.commit()
 
     logger.info(
         "gmail_compose: send ok",
         extra={
             "user_id": user_id,
             "submission_id": submission_id,
+            "contact_id": contact_id,
             "thread_id": returned_thread_id,
             "gmail_message_id": sent_id,
         },
@@ -420,7 +533,7 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         "gmail_compose: enter", extra={"user_sub": sub, "route_key": route_key}
     )
 
-    if route_key != "POST /submissions/{id}/send":
+    if route_key != "POST /messages/send":
         return _response(404, {"error": "not found"})
 
     try:
@@ -445,13 +558,11 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
                 gmail_address=cred["gmail_address"],
                 refresh_token_ciphertext=cred["refresh_token_ciphertext"],
                 scopes=cred["scopes"],
-                submission_id=_path_id(event),
                 body=body,
             )
 
         logger.info(
-            "gmail_compose: exit ok",
-            extra={"user_sub": sub, "submission_id": _path_id(event)},
+            "gmail_compose: exit ok", extra={"user_sub": sub}
         )
         return _response(200, result)
     except _ScopeError:

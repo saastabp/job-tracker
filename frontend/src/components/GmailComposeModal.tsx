@@ -8,6 +8,14 @@ interface ResumeOption {
   is_master: boolean;
 }
 
+interface SubmissionOption {
+  id: number;
+  role_title: string | null;
+  company_name: string | null;
+  status: string;
+  gmail_thread_id: string | null;
+}
+
 interface ReplyContext {
   /** Gmail message id of the response being replied to (NOT the local id). */
   gmail_message_id: string;
@@ -24,12 +32,29 @@ interface ReplyContext {
 interface Props {
   show: boolean;
   onHide: () => void;
-  submissionId: number;
+  /**
+   * The submission this compose is anchored to (when launched from
+   * SubmissionDetail) or pre-selected in the picker (when launched
+   * from ContactDetail with a hint). User can change to "(none)" or
+   * any open submission unless the modal is in reply mode.
+   */
+  defaultSubmissionId?: number | null;
+  /**
+   * The contact this compose is logged against. Locked at modal open —
+   * if the user wants to log against a different contact, they close
+   * and reopen from a different page. Null when launched from
+   * SubmissionDetail.
+   */
+  defaultContactId?: number | null;
+  /** Display name for the contact-context banner. */
+  contactBannerLabel?: string | null;
+  /** Pre-fill for the To field — typically the contact's email when launched from ContactDetail. */
+  defaultTo?: string;
   /** Compose mode: undefined. Reply mode: response context. */
   replyTo?: ReplyContext;
   /** Default resume id (typically the master). */
   defaultResumeId?: number | null;
-  /** Called after a successful send; parent should refresh submission detail. */
+  /** Called after a successful send; parent should refresh. */
   onSent: () => void;
   /** Bubbles up to the parent so it can redirect to OAuth start. */
   onNeedReconsent: () => void;
@@ -43,17 +68,9 @@ function commaList(input: string): string[] {
 }
 
 function stripReplyPrefix(subject: string): string {
-  // Strip leading "Re:" / "RE: " / "re:" chains so we don't end up with
-  // "Re: Re: Re: ...". Idempotent: empty input → empty.
   return subject.replace(/^(\s*re\s*:\s*)+/i, '').trim();
 }
 
-/**
- * Build the quoted-original block prepended to the textarea in reply mode.
- * Format roughly matches Gmail / RFC 1849: a blank line, an attribution line,
- * then `> `-prefixed body lines. The user's reply goes ABOVE this block (caret
- * positioned at the very top by the textarea ref).
- */
 function buildQuotedOriginal(replyTo: ReplyContext): string {
   if (!replyTo.body || !replyTo.body.trim()) {
     return '';
@@ -68,10 +85,18 @@ function buildQuotedOriginal(replyTo: ReplyContext): string {
   return `\n\n${attribution}\n${quotedLines}`;
 }
 
+function submissionOptionLabel(s: SubmissionOption): string {
+  const role = s.role_title || `Submission #${s.id}`;
+  return s.company_name ? `${role} — ${s.company_name}` : role;
+}
+
 export default function GmailComposeModal({
   show,
   onHide,
-  submissionId,
+  defaultSubmissionId,
+  defaultContactId,
+  contactBannerLabel,
+  defaultTo,
   replyTo,
   defaultResumeId,
   onSent,
@@ -87,6 +112,10 @@ export default function GmailComposeModal({
   const [body, setBody] = useState('');
   const [resumes, setResumes] = useState<ResumeOption[] | null>(null);
   const [resumeId, setResumeId] = useState<string>('');
+  const [submissions, setSubmissions] = useState<SubmissionOption[] | null>(null);
+  // The picker's selected value: '' = (none), otherwise the submission id
+  // as a string (Form.Select values are always strings).
+  const [submissionPick, setSubmissionPick] = useState<string>('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -99,14 +128,12 @@ export default function GmailComposeModal({
       setTo(replyTo.from_email ?? '');
       const stripped = stripReplyPrefix(replyTo.subject ?? '');
       setSubject(stripped ? `Re: ${stripped}` : 'Re: ');
-      // Prefill the textarea with the quoted-original block. The user types
-      // their reply above the blank lines at the top.
       setBody(buildQuotedOriginal(replyTo));
       setCc('');
       setBcc('');
       setShowCcBcc(false);
     } else {
-      setTo('');
+      setTo(defaultTo ?? '');
       setSubject('');
       setBody('');
       setCc('');
@@ -114,9 +141,12 @@ export default function GmailComposeModal({
       setShowCcBcc(false);
     }
     setResumeId(defaultResumeId != null ? String(defaultResumeId) : '');
-  }, [show, replyTo, defaultResumeId]);
+    setSubmissionPick(
+      defaultSubmissionId != null ? String(defaultSubmissionId) : '',
+    );
+  }, [show, replyTo, defaultResumeId, defaultSubmissionId, defaultTo]);
 
-  // Fetch resume picker options once the modal opens (cheap; small list).
+  // Fetch resume picker options once the modal opens.
   useEffect(() => {
     if (!show || resumes !== null) return;
     apiFetch('/resumes')
@@ -124,9 +154,39 @@ export default function GmailComposeModal({
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((d: { items: ResumeOption[] }) => setResumes(d.items ?? []))
+      .then((rows: ResumeOption[]) => setResumes(rows ?? []))
       .catch((e) => setError(`couldn't load resumes: ${e}`));
   }, [show, resumes, apiFetch]);
+
+  // Fetch submissions for the picker (compose mode only — reply mode
+  // hides the picker because the link is implicit).
+  useEffect(() => {
+    if (!show || replyTo || submissions !== null) return;
+    apiFetch('/submissions')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: any[]) =>
+        setSubmissions(
+          rows.map((s) => ({
+            id: s.id,
+            role_title: s.role_title,
+            company_name: s.company_name,
+            status: s.status,
+            gmail_thread_id: s.gmail_thread_id ?? null,
+          })),
+        ),
+      )
+      .catch(() => setSubmissions([]));
+  }, [show, replyTo, submissions, apiFetch]);
+
+  // Picker shows submissions without a linked thread, plus the current
+  // default if it's already linked (the sender knows what they're
+  // doing — but the server still rejects "compose against a linked
+  // submission" as a 400, so it's defense-in-depth).
+  const submissionChoices = (submissions ?? []).filter(
+    (s) =>
+      s.gmail_thread_id == null ||
+      (defaultSubmissionId != null && s.id === defaultSubmissionId),
+  );
 
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
@@ -146,12 +206,31 @@ export default function GmailComposeModal({
       return;
     }
 
+    // Resolve which submission anchor to send. In reply mode we always
+    // anchor to defaultSubmissionId (the picker is hidden); otherwise
+    // the picker controls it.
+    const submissionAnchor = replyTo
+      ? defaultSubmissionId ?? null
+      : submissionPick
+        ? Number(submissionPick)
+        : null;
+    const contactAnchor = defaultContactId ?? null;
+
+    if (submissionAnchor == null && contactAnchor == null) {
+      setError(
+        'Pick a submission or open this modal from a contact — at least one anchor is required.',
+      );
+      return;
+    }
+
     setSending(true);
     try {
       const payload: Record<string, unknown> = {
         to: toList,
         subject: subject.trim(),
         body,
+        submission_id: submissionAnchor,
+        contact_id: contactAnchor,
       };
       const ccList = commaList(cc);
       if (ccList.length > 0) payload.cc = ccList;
@@ -160,7 +239,7 @@ export default function GmailComposeModal({
       if (resumeId) payload.resume_id = Number(resumeId);
       if (replyTo) payload.in_reply_to_message_id = replyTo.gmail_message_id;
 
-      const r = await apiFetch(`/submissions/${submissionId}/send`, {
+      const r = await apiFetch('/messages/send', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
@@ -204,6 +283,35 @@ export default function GmailComposeModal({
         </Modal.Header>
         <Modal.Body>
           {error && <Alert variant="danger">{error}</Alert>}
+
+          {defaultContactId != null && contactBannerLabel && (
+            <Alert variant="info" className="py-2 mb-3">
+              Logging outreach for <strong>{contactBannerLabel}</strong>.
+            </Alert>
+          )}
+
+          {!replyTo && (
+            <Form.Group className="mb-3">
+              <Form.Label>Submission</Form.Label>
+              <Form.Select
+                value={submissionPick}
+                onChange={(e) => setSubmissionPick(e.target.value)}
+                disabled={sending || submissions === null}
+              >
+                <option value="">— None (contact-only) —</option>
+                {submissionChoices.map((s) => (
+                  <option key={s.id} value={String(s.id)}>
+                    {submissionOptionLabel(s)}
+                  </option>
+                ))}
+              </Form.Select>
+              <Form.Text className="text-muted">
+                Linking a submission attaches the Gmail thread for response
+                tracking. Leave as “None” for cold outreach to a contact.
+              </Form.Text>
+            </Form.Group>
+          )}
+
           <Form.Group className="mb-3">
             <Form.Label>To</Form.Label>
             <Form.Control

@@ -1,4 +1,4 @@
-"""EventBridge-scheduled poller — fetches new responses for each user's linked threads.
+"""EventBridge-scheduled poller — fetches new messages for each user's linked threads.
 
 Invoked by an EventBridge rate(10 minutes) rule from the gmail stack
 (``infra/gmail/template.yaml``). The event payload is the synthetic
@@ -6,23 +6,30 @@ Invoked by an EventBridge rate(10 minutes) rule from the gmail stack
 
 Per-user loop, one DB connection per user so one user's failure is
 isolated from the rest. For each user with active ``gmail_credentials``,
-the handler enumerates every submission with a non-NULL
-``gmail_thread_id``, calls ``users.threads.get(format='full')`` once per
-thread, walks the messages, and for each:
+the handler enumerates the union of the user's
+``submissions.gmail_thread_id`` and ``contact_outreach.gmail_thread_id``
+values (slice 10 — contact-only threads are now polled too), calls
+``users.threads.get(format='full')`` once per unique thread, walks the
+messages, and for each non-self-sent message:
 
-  * filters out self-sent messages (``from`` matches the user's
-    ``gmail_address`` from credentials — Decision per slice plan; the
-    user's own outbound is implicit in the success of their compose UX)
-  * skips messages already in ``responses`` (the
-    ``uq_responses_gmail_message`` unique key makes ``INSERT IGNORE``
-    the idempotency primitive)
-  * classifies via heuristic-only patterns (slice 09 Decision 2 — AI
-    fallback deferred until real miss patterns surface)
   * archives raw RFC 822 bytes to the gmail-stack S3 bucket
-    (``responses.raw_email_s3_key`` points there). Best-effort: an
-    archive failure doesn't block the row insert.
-  * inserts a ``responses`` row, optionally bumps the submission's
-    status on ``rejection`` / ``interview_invite``
+    (best-effort; archive failure doesn't block row inserts)
+  * for every submission whose ``gmail_thread_id`` matches the thread:
+    inserts a ``responses`` row (INSERT IGNORE on
+    ``uq_responses_gmail_message`` for idempotency); classifies via the
+    heuristic patterns; bumps the submission's status on
+    ``rejection`` / ``interview_invite``
+  * if the thread also has ``contact_outreach`` rows: inserts an
+    inbound ``contact_outreach`` row tagged to the thread's most-recent
+    existing contact_id (Fork 1 — slice 10 plan), via INSERT IGNORE on
+    ``uq_contact_outreach_gmail_message``
+
+Self-sent messages are filtered out by ``from`` matching the user's
+``gmail_address`` from credentials. The user's outbound — written by
+the compose handler at send time — already lives in
+``contact_outreach`` and/or via ``submissions.gmail_thread_id``; the
+poller's fetch returns it but the self-sent filter drops it before any
+insert is attempted.
 
 After all threads for a user are processed, ``last_polled_at`` is
 updated. ``last_history_id`` is left NULL for now — we don't use the
@@ -221,8 +228,15 @@ def _internal_date_to_datetime(internal_date_ms: str) -> datetime:
 # ---------------------------------------------------------------------------
 
 
-def _load_catalog_ids(conn: Any) -> tuple[dict[str, int], dict[str, int]]:
-    """Return (classification_short_name → id, status_short_name → id)."""
+def _load_catalog_ids(
+    conn: Any,
+) -> tuple[dict[str, int], dict[str, int], int, int]:
+    """Return (classifications, statuses, email_method_id, inbound_direction_id).
+
+    The poller writes to ``responses`` (needs response_classifications +
+    submission_statuses for the status bump) AND to ``contact_outreach``
+    (needs outreach_methods.email + outreach_directions.inbound).
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT short_name, id FROM response_classifications "
@@ -235,7 +249,28 @@ def _load_catalog_ids(conn: Any) -> tuple[dict[str, int], dict[str, int]]:
             "WHERE deleted_at IS NULL"
         )
         statuses = {row["short_name"]: int(row["id"]) for row in cur.fetchall()}
-    return classifications, statuses
+
+        cur.execute(
+            "SELECT id FROM outreach_methods "
+            "WHERE short_name = 'email' AND deleted_at IS NULL"
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("outreach_methods.short_name='email' not found")
+        email_method_id = int(row["id"])
+
+        cur.execute(
+            "SELECT id FROM outreach_directions "
+            "WHERE short_name = 'inbound' AND deleted_at IS NULL"
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(
+                "outreach_directions.short_name='inbound' not found"
+            )
+        inbound_direction_id = int(row["id"])
+
+    return classifications, statuses, email_method_id, inbound_direction_id
 
 
 # ---------------------------------------------------------------------------
@@ -243,75 +278,74 @@ def _load_catalog_ids(conn: Any) -> tuple[dict[str, int], dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 
-def _process_message(
+def _archive_raw(
     *,
-    conn: Any,
     service: Any,
     user_id: int,
-    submission_id: int,
-    msg: dict[str, Any],
-    gmail_address: str,
-    classifications: dict[str, int],
-    statuses: dict[str, int],
+    msg_id: str,
     archive_bucket: str,
-) -> str:
-    """Process one Gmail message. Returns one of: skipped:self_sent, skipped:exists, inserted."""
-    msg_id = msg["id"]
-    payload = msg.get("payload", {})
-    headers = _extract_headers(payload)
-    from_email = _extract_from_email(headers)
-    subject = headers.get("subject", "")
+) -> str | None:
+    """Fetch raw RFC 822 bytes and store in S3. Returns the S3 key, or None on failure.
 
-    if from_email and from_email.lower() == gmail_address.lower():
+    Best-effort: a 5xx from Gmail or a bucket-side failure returns None
+    rather than raising. The caller falls through to writing rows with
+    ``raw_email_s3_key = NULL``.
+    """
+    if not archive_bucket:
+        return None
+    try:
+        raw_msg = (
+            service.users()
+            .messages()
+            .get(userId="me", id=msg_id, format="raw")
+            .execute()
+        )
+        raw_bytes = base64.urlsafe_b64decode(raw_msg["raw"])
+        s3_key = f"{user_id}/{msg_id}.eml"
+        _get_s3().put_object(
+            Bucket=archive_bucket,
+            Key=s3_key,
+            Body=raw_bytes,
+            ContentType="message/rfc822",
+        )
         logger.info(
-            "gmail_poller: skipping self-sent message",
+            "gmail_poller: archived raw email",
             extra={
                 "user_id": user_id,
-                "submission_id": submission_id,
                 "gmail_message_id": msg_id,
+                "s3_key": s3_key,
+                "raw_bytes": len(raw_bytes),
             },
         )
-        return "skipped:self_sent"
+        return s3_key
+    except Exception:
+        logger.exception(
+            "gmail_poller: S3 archive failed (continuing with row inserts)",
+            extra={"user_id": user_id, "gmail_message_id": msg_id},
+        )
+        return None
 
-    received_at = _internal_date_to_datetime(msg["internalDate"])
-    body_text = _extract_body_text(payload)
 
-    # Fetch raw bytes for S3 archive. Best-effort — a 5xx from Gmail or a
-    # bucket-side failure shouldn't block the response row from landing.
-    s3_key: str | None = None
-    if archive_bucket:
-        try:
-            raw_msg = (
-                service.users()
-                .messages()
-                .get(userId="me", id=msg_id, format="raw")
-                .execute()
-            )
-            raw_bytes = base64.urlsafe_b64decode(raw_msg["raw"])
-            s3_key = f"{user_id}/{msg_id}.eml"
-            _get_s3().put_object(
-                Bucket=archive_bucket,
-                Key=s3_key,
-                Body=raw_bytes,
-                ContentType="message/rfc822",
-            )
-            logger.info(
-                "gmail_poller: archived raw email",
-                extra={
-                    "user_id": user_id,
-                    "gmail_message_id": msg_id,
-                    "s3_key": s3_key,
-                    "raw_bytes": len(raw_bytes),
-                },
-            )
-        except Exception:
-            logger.exception(
-                "gmail_poller: S3 archive failed (continuing with row insert)",
-                extra={"user_id": user_id, "gmail_message_id": msg_id},
-            )
-            s3_key = None
+def _insert_response_row(
+    *,
+    conn: Any,
+    user_id: int,
+    submission_id: int,
+    msg_id: str,
+    received_at: datetime,
+    from_email: str,
+    subject: str,
+    body_text: str,
+    s3_key: str | None,
+    classification_short: str,
+    classifications: dict[str, int],
+    statuses: dict[str, int],
+) -> str:
+    """Insert into ``responses`` and bump submission status if applicable.
 
-    classification_short = classify(subject, body_text)
+    Returns ``"inserted"`` on a successful new row, or ``"skipped:exists"``
+    when ``INSERT IGNORE`` matched the unique key on ``gmail_message_id``.
+    """
     classification_id = classifications.get(classification_short)
     if classification_id is None:
         # `other` is seeded; if it's missing, the migration wasn't applied.
@@ -347,7 +381,6 @@ def _process_message(
             conn.commit()
             return "skipped:exists"
 
-        # Status bump (if applicable)
         target_status_short = _STATUS_BUMP_MAP.get(classification_short)
         if target_status_short:
             target_status_id = statuses.get(target_status_short)
@@ -382,20 +415,133 @@ def _process_message(
     return "inserted"
 
 
+def _insert_contact_outreach_row(
+    *,
+    conn: Any,
+    user_id: int,
+    contact_id: int,
+    msg_id: str,
+    thread_id: str,
+    received_at: datetime,
+    from_email: str,
+    subject: str,
+    body_text: str,
+    email_method_id: int,
+    inbound_direction_id: int,
+) -> str:
+    """Insert an inbound ``contact_outreach`` row. ``INSERT IGNORE`` for idempotency."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT IGNORE INTO contact_outreach
+                (user_id, contact_id, outreach_at,
+                 outreach_method_id, outreach_direction_id,
+                 gmail_thread_id, gmail_message_id,
+                 subject, body_text, from_email)
+            VALUES (%s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s, %s)
+            """,
+            (
+                user_id, contact_id, received_at,
+                email_method_id, inbound_direction_id,
+                thread_id, msg_id,
+                subject[:998] if subject else None,
+                body_text or None,
+                from_email,
+            ),
+        )
+        inserted = cur.rowcount > 0
+        conn.commit()
+
+    if not inserted:
+        logger.info(
+            "gmail_poller: contact_outreach row already present, skipping",
+            extra={
+                "contact_id": contact_id,
+                "gmail_message_id": msg_id,
+            },
+        )
+        return "skipped:exists"
+
+    logger.info(
+        "gmail_poller: contact_outreach row inserted",
+        extra={
+            "contact_id": contact_id,
+            "gmail_message_id": msg_id,
+            "from_email_domain": from_email.split("@")[-1] if "@" in from_email else None,
+        },
+    )
+    return "inserted"
+
+
+def _resolve_thread_anchors(
+    conn: Any, user_id: int, thread_id: str
+) -> tuple[list[int], int | None]:
+    """Look up what a thread maps to: list of submission_ids + most-recent contact_id.
+
+    Returns
+    -------
+    (submission_ids, most_recent_contact_id)
+        Both can be empty / None — a thread might be linked only to
+        submissions, only to contacts, both, or in pathological cases
+        neither (e.g. the user unlinked everything between enumeration
+        and per-thread fetch). The caller decides what to do.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM submissions "
+            "WHERE user_id = %s AND gmail_thread_id = %s "
+            "  AND deleted_at IS NULL",
+            (user_id, thread_id),
+        )
+        submission_ids = [int(r["id"]) for r in cur.fetchall()]
+
+        # Most-recent contact_id on this thread (Fork 1).
+        cur.execute(
+            "SELECT contact_id FROM contact_outreach "
+            "WHERE user_id = %s AND gmail_thread_id = %s "
+            "  AND deleted_at IS NULL "
+            "ORDER BY outreach_at DESC, id DESC LIMIT 1",
+            (user_id, thread_id),
+        )
+        row = cur.fetchone()
+        contact_id = int(row["contact_id"]) if row else None
+
+    return submission_ids, contact_id
+
+
 def _process_thread(
     *,
     conn: Any,
     service: Any,
     user_id: int,
-    submission_id: int,
     thread_id: str,
     gmail_address: str,
     classifications: dict[str, int],
     statuses: dict[str, int],
+    email_method_id: int,
+    inbound_direction_id: int,
     archive_bucket: str,
 ) -> dict[str, int]:
-    """Fetch a thread, process each message. Returns counters by status."""
-    counters = {"inserted": 0, "skipped:self_sent": 0, "skipped:exists": 0}
+    """Fetch a thread, dual-write each non-self-sent message. Returns counters."""
+    counters = {
+        "responses_inserted": 0,
+        "responses_skipped:exists": 0,
+        "contact_outreach_inserted": 0,
+        "contact_outreach_skipped:exists": 0,
+        "skipped:self_sent": 0,
+    }
+
+    submission_ids, contact_id = _resolve_thread_anchors(conn, user_id, thread_id)
+    if not submission_ids and contact_id is None:
+        logger.info(
+            "gmail_poller: thread has no live anchors, skipping",
+            extra={"user_id": user_id, "thread_id": thread_id},
+        )
+        return counters
+
     thread = (
         service.users()
         .threads()
@@ -407,35 +553,108 @@ def _process_thread(
         "gmail_poller: thread fetched",
         extra={
             "user_id": user_id,
-            "submission_id": submission_id,
             "thread_id": thread_id,
             "message_count": len(messages),
+            "submission_count": len(submission_ids),
+            "has_contact_anchor": contact_id is not None,
         },
     )
+
     for msg in messages:
         try:
-            outcome = _process_message(
-                conn=conn,
+            msg_id = msg["id"]
+            payload = msg.get("payload", {})
+            headers = _extract_headers(payload)
+            from_email = _extract_from_email(headers)
+            subject = headers.get("subject", "")
+
+            if from_email and from_email.lower() == gmail_address.lower():
+                logger.info(
+                    "gmail_poller: skipping self-sent message",
+                    extra={
+                        "user_id": user_id,
+                        "thread_id": thread_id,
+                        "gmail_message_id": msg_id,
+                    },
+                )
+                counters["skipped:self_sent"] += 1
+                continue
+
+            received_at = _internal_date_to_datetime(msg["internalDate"])
+            body_text = _extract_body_text(payload)
+            classification_short = classify(subject, body_text)
+
+            s3_key = _archive_raw(
                 service=service,
                 user_id=user_id,
-                submission_id=submission_id,
-                msg=msg,
-                gmail_address=gmail_address,
-                classifications=classifications,
-                statuses=statuses,
+                msg_id=msg_id,
                 archive_bucket=archive_bucket,
             )
-            counters[outcome] = counters.get(outcome, 0) + 1
+
+            for sub_id in submission_ids:
+                outcome = _insert_response_row(
+                    conn=conn,
+                    user_id=user_id,
+                    submission_id=sub_id,
+                    msg_id=msg_id,
+                    received_at=received_at,
+                    from_email=from_email,
+                    subject=subject,
+                    body_text=body_text,
+                    s3_key=s3_key,
+                    classification_short=classification_short,
+                    classifications=classifications,
+                    statuses=statuses,
+                )
+                key = f"responses_{outcome}"
+                counters[key] = counters.get(key, 0) + 1
+
+            if contact_id is not None:
+                outcome = _insert_contact_outreach_row(
+                    conn=conn,
+                    user_id=user_id,
+                    contact_id=contact_id,
+                    msg_id=msg_id,
+                    thread_id=thread_id,
+                    received_at=received_at,
+                    from_email=from_email,
+                    subject=subject,
+                    body_text=body_text,
+                    email_method_id=email_method_id,
+                    inbound_direction_id=inbound_direction_id,
+                )
+                key = f"contact_outreach_{outcome}"
+                counters[key] = counters.get(key, 0) + 1
         except Exception:
             logger.exception(
                 "gmail_poller: message processing failed (continuing)",
                 extra={
                     "user_id": user_id,
-                    "submission_id": submission_id,
+                    "thread_id": thread_id,
                     "gmail_message_id": msg.get("id"),
                 },
             )
     return counters
+
+
+def _enumerate_thread_ids(conn: Any, user_id: int) -> list[str]:
+    """Return the union of submission- and contact-linked thread ids for a user."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT thread_id FROM (
+                SELECT gmail_thread_id AS thread_id FROM submissions
+                 WHERE user_id = %s AND deleted_at IS NULL
+                   AND gmail_thread_id IS NOT NULL
+                UNION
+                SELECT gmail_thread_id AS thread_id FROM contact_outreach
+                 WHERE user_id = %s AND deleted_at IS NULL
+                   AND gmail_thread_id IS NOT NULL
+            ) t
+            """,
+            (user_id, user_id),
+        )
+        return [row["thread_id"] for row in cur.fetchall()]
 
 
 def _process_user(
@@ -459,38 +678,33 @@ def _process_user(
     )
     service = build_gmail_service(credentials)
 
-    classifications, statuses = _load_catalog_ids(conn)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, gmail_thread_id FROM submissions "
-            "WHERE user_id = %s AND deleted_at IS NULL "
-            "  AND gmail_thread_id IS NOT NULL",
-            (user_id,),
-        )
-        linked = list(cur.fetchall())
+    classifications, statuses, email_method_id, inbound_direction_id = (
+        _load_catalog_ids(conn)
+    )
+    thread_ids = _enumerate_thread_ids(conn, user_id)
 
     logger.info(
         "gmail_poller: user threads enumerated",
         extra={
             "user_id": user_id,
-            "linked_thread_count": len(linked),
+            "linked_thread_count": len(thread_ids),
             "gmail_address": gmail_address,
         },
     )
 
-    aggregate = {"inserted": 0, "skipped:self_sent": 0, "skipped:exists": 0}
-    for sub_row in linked:
+    aggregate: dict[str, int] = {}
+    for thread_id in thread_ids:
         try:
             counters = _process_thread(
                 conn=conn,
                 service=service,
                 user_id=user_id,
-                submission_id=int(sub_row["id"]),
-                thread_id=sub_row["gmail_thread_id"],
+                thread_id=thread_id,
                 gmail_address=gmail_address,
                 classifications=classifications,
                 statuses=statuses,
+                email_method_id=email_method_id,
+                inbound_direction_id=inbound_direction_id,
                 archive_bucket=archive_bucket,
             )
             for k, v in counters.items():
@@ -498,11 +712,7 @@ def _process_user(
         except Exception:
             logger.exception(
                 "gmail_poller: thread processing failed (continuing)",
-                extra={
-                    "user_id": user_id,
-                    "submission_id": int(sub_row["id"]),
-                    "thread_id": sub_row["gmail_thread_id"],
-                },
+                extra={"user_id": user_id, "thread_id": thread_id},
             )
 
     # Mark the user as polled even if some threads failed.
@@ -535,7 +745,6 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         )
         return {"users_processed": 0, "error": "misconfigured"}
 
-    # List of (user_id, gmail_address, refresh_token_ciphertext, scopes)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -549,7 +758,7 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         "gmail_poller: active users", extra={"user_count": len(active)}
     )
 
-    aggregate = {"inserted": 0, "skipped:self_sent": 0, "skipped:exists": 0}
+    aggregate: dict[str, int] = {}
     failures = 0
     for user in active:
         try:

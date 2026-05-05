@@ -1,6 +1,19 @@
 # Slice 10 — Contact-initiated email + unified compose (PLAN)
 
-Status: planned, not started. Branch: `slice/10-contact-email` (TBD).
+Status: forks locked, implementation underway. Branch: `slice/10-contact-email`.
+
+## Locked fork decisions (2026-05-05)
+
+- **Fork 1**: most-recent contact only. Inbound row picks the contact_id of
+  the thread's most-recent existing `contact_outreach` row. Unique key on
+  `gmail_message_id` stays globally unique.
+- **Fork 2**: implicit-yes via `threads.get`. No new code in the link
+  handler; the next poll cycle backfills `responses` retroactively.
+- **Fork 3**: same row format expanded. One chronological list, direction
+  icon, email rows show subject + click-to-expand body, manual rows show
+  notes.
+- **Fork 4**: reject 400 when neither `submission_id` nor `contact_id` set.
+- **Fork 5**: open compose modal with empty To when contact lacks email.
 Depends on slice 9 (`docs/slices/09-email.md`) shipped, deployed, and
 verified end-to-end (it is — `gmail_credentials` populated, OAuth +
 poll + compose + reply all working through the SPA against real

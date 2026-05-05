@@ -197,6 +197,7 @@ def _list(conn: Any, user_id: int, qs: dict[str, str]) -> list[dict[str, Any]]:
             s.company_id, c.name AS company_name,
             ss.short_name AS status,
             s.tailored_title, s.tailored_summary, s.jd_url,
+            s.gmail_thread_id,
             s.created_at, s.updated_at
         FROM submissions s
         JOIN submission_statuses ss ON ss.id = s.submission_status_id
@@ -224,6 +225,7 @@ def _row_to_summary(r: dict[str, Any]) -> dict[str, Any]:
         "tailored_title": r["tailored_title"],
         "tailored_summary": r["tailored_summary"],
         "jd_url": r["jd_url"],
+        "gmail_thread_id": r.get("gmail_thread_id"),
     }
 
 
