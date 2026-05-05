@@ -30,15 +30,15 @@ Two modes (orthogonal to the anchor question):
     carried into the contact_outreach insert.
 
 * **Reply mode** (``in_reply_to_message_id`` present)
-    Submission MUST be present AND have a ``gmail_thread_id`` (i.e.
-    either previously sent via the app or manually linked via the
-    admin handler). Contact-only reply (``contact_id`` set, no
-    ``submission_id``) is rejected — slice-10 v1 doesn't support it;
-    user creates a submission and links the thread first. The handler
-    fetches the original message's RFC 822 ``Message-ID`` and
-    ``References`` headers, builds proper threading headers
-    (``In-Reply-To``, ``References``), and passes ``threadId`` in the
-    send request as a belt-and-suspenders check alongside the headers.
+    A thread anchor must resolve from whichever side is set:
+    ``submissions.gmail_thread_id`` (slice 9) or — for contact-only
+    replies — the contact's most-recent ``contact_outreach.gmail_thread_id``
+    (slice 10.5). If the user posts a reply with neither submission nor
+    contact carrying a thread, the handler 400s. The handler fetches the
+    original message's RFC 822 ``Message-ID`` and ``References`` headers,
+    builds proper threading headers (``In-Reply-To``, ``References``),
+    and passes ``threadId`` in the send request as a belt-and-suspenders
+    check alongside the headers.
 
 Plaintext body only — slice 09 locked decision (no rich text, no
 multipart/alternative). Optional resume attachment: ``resume_id``
@@ -372,16 +372,27 @@ def _send(
     references_chain = ""
 
     if in_reply_to_msg_id:
-        # Reply mode requires a submission anchor with a linked thread.
-        # Slice-10 v1 doesn't support reply-against-contact-only-thread.
-        if submission_id is None:
-            raise ValueError(
-                "reply requires submission_id; reply-from-contact-only "
-                "thread is not supported"
-            )
+        # Reply mode resolves a thread anchor from whichever side has one:
+        # submissions.gmail_thread_id (slice 9) or, when the user is
+        # replying from ContactDetail without a submission link, the
+        # most-recent contact_outreach.gmail_thread_id for this contact
+        # (slice 10.5).
+        if not current_thread_id and contact_id is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT gmail_thread_id FROM contact_outreach "
+                    "WHERE user_id = %s AND contact_id = %s "
+                    "  AND deleted_at IS NULL "
+                    "  AND gmail_thread_id IS NOT NULL "
+                    "ORDER BY outreach_at DESC, id DESC LIMIT 1",
+                    (user_id, contact_id),
+                )
+                co_row = cur.fetchone()
+            if co_row:
+                current_thread_id = co_row["gmail_thread_id"]
         if not current_thread_id:
             raise ValueError(
-                "cannot reply: submission has no linked thread"
+                "cannot reply: no linked thread on submission or contact"
             )
         original_rfc, original_refs = _fetch_in_reply_to_headers(
             service, in_reply_to_msg_id

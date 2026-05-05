@@ -10,6 +10,9 @@ interface Metric {
   pending?: number;
   daily: number | null;
   weekly: number | null;
+  /** Inbound counters present on outreach metrics; undefined elsewhere. */
+  inbound_today?: number;
+  inbound_week?: number;
 }
 
 interface RecentSubmission {
@@ -43,10 +46,12 @@ function ProgressTile({
   label,
   count,
   goal,
+  inboundCount,
 }: {
   label: string;
   count: number;
   goal: number | null;
+  inboundCount?: number;
 }) {
   const target = goal ?? 0;
   const pct = target > 0 ? Math.min(100, (count / target) * 100) : 0;
@@ -59,6 +64,11 @@ function ProgressTile({
           <span className="text-muted fs-5"> of {goal ?? '—'}</span>
         </div>
         <ProgressBar now={pct} className="mt-2" style={{ height: 6 }} />
+        {inboundCount !== undefined && (
+          <div className="text-muted small mt-1">
+            ↓ {inboundCount} inbound
+          </div>
+        )}
       </Card.Body>
     </Card>
   );
@@ -96,6 +106,7 @@ export default function Dashboard() {
               label={label}
               count={m[key].today ?? 0}
               goal={m[key].daily}
+              inboundCount={m[key].inbound_today}
             />
           </Col>
         ))}
@@ -109,6 +120,7 @@ export default function Dashboard() {
               label={label}
               count={m[key].week ?? 0}
               goal={m[key].weekly}
+              inboundCount={m[key].inbound_week}
             />
           </Col>
         ))}

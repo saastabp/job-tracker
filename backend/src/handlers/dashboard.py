@@ -10,11 +10,21 @@ Response shape::
       "week_start": "2026-04-27",
       "metrics": {
         "submissions":        {"today": 0, "week": 0, "daily": 5, "weekly": 25},
-        "personal_outreach":  {"today": 0, "week": 0, "daily": null, "weekly": null},
-        "recruiter_outreach": {"today": 0, "week": 0, "daily": null, "weekly": null},
+        "personal_outreach":  {"today": 0, "week": 0, "daily": null, "weekly": null,
+                               "inbound_today": 0, "inbound_week": 0},
+        "recruiter_outreach": {"today": 0, "week": 0, "daily": null, "weekly": null,
+                               "inbound_today": 0, "inbound_week": 0},
         "follow_ups":         {"pending": 0,           "daily": null, "weekly": null}
       }
     }
+
+The ``today`` / ``week`` counters on outreach metrics still measure
+*outbound* events (what the goals track — "did I reach out enough this
+week?"). ``inbound_today`` / ``inbound_week`` are a parallel counter
+that surfaces incoming pings the user logged or the poller imported.
+Surfaced as a separate field so the goal mechanic stays untouched but
+the user can still see "the recruiters got back to me N times this
+week" at a glance.
 
 ``follow_ups`` reports a pending count (rows with ``actioned_at IS NULL``)
 rather than today/week, because that is what the user actions on.
@@ -41,12 +51,19 @@ def _zero_metric() -> dict[str, Any]:
     return {"today": 0, "week": 0, "daily": None, "weekly": None}
 
 
+def _zero_outreach_metric() -> dict[str, Any]:
+    return {
+        "today": 0, "week": 0, "daily": None, "weekly": None,
+        "inbound_today": 0, "inbound_week": 0,
+    }
+
+
 def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
     logger.info("dashboard: querying counts", extra={"user_id": user_id})
     metrics: dict[str, Any] = {
         "submissions": _zero_metric(),
-        "personal_outreach": _zero_metric(),
-        "recruiter_outreach": _zero_metric(),
+        "personal_outreach": _zero_outreach_metric(),
+        "recruiter_outreach": _zero_outreach_metric(),
         "follow_ups": {"pending": 0, "daily": None, "weekly": None},
     }
 
@@ -65,13 +82,17 @@ def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
         metrics["submissions"]["today"] = int(row.get("today_count") or 0)
         metrics["submissions"]["week"] = int(row.get("week_count") or 0)
 
-        # Only outbound events count toward the user's outreach targets —
-        # inbound recruiter pings are tracked but shouldn't inflate the
-        # "did I reach out enough this week?" widgets.
+        # Outbound events still drive the goal counters — that's what the
+        # widgets ask "did I reach out enough this week?" against. Inbound
+        # events (the recruiter pinged me, or the poller imported a thread)
+        # populate parallel `inbound_today` / `inbound_week` fields so the
+        # user can see "they got back to me N times" without inflating the
+        # goal numerator.
         cur.execute(
             """
             SELECT
                 ck.short_name AS kind,
+                od.short_name AS direction,
                 SUM(CASE WHEN DATE(co.outreach_at) = CURDATE() THEN 1 ELSE 0 END) AS today_count,
                 SUM(CASE WHEN YEARWEEK(co.outreach_at, 1) = YEARWEEK(CURDATE(), 1) THEN 1 ELSE 0 END) AS week_count
             FROM contact_outreach co
@@ -80,15 +101,20 @@ def _query_counts(conn: Any, user_id: int) -> dict[str, Any]:
             JOIN outreach_directions od ON od.id = co.outreach_direction_id
             WHERE co.user_id = %s
               AND co.deleted_at IS NULL
-              AND od.short_name = 'outbound'
-            GROUP BY ck.short_name
+            GROUP BY ck.short_name, od.short_name
             """,
             (user_id,),
         )
         for r in cur.fetchall():
             key = "personal_outreach" if r["kind"] == "personal" else "recruiter_outreach"
-            metrics[key]["today"] = int(r.get("today_count") or 0)
-            metrics[key]["week"] = int(r.get("week_count") or 0)
+            today = int(r.get("today_count") or 0)
+            week = int(r.get("week_count") or 0)
+            if r["direction"] == "outbound":
+                metrics[key]["today"] = today
+                metrics[key]["week"] = week
+            else:  # inbound
+                metrics[key]["inbound_today"] = today
+                metrics[key]["inbound_week"] = week
 
         cur.execute(
             """

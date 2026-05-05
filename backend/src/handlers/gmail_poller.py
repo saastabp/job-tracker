@@ -525,7 +525,66 @@ def _process_thread(
     inbound_direction_id: int,
     archive_bucket: str,
 ) -> dict[str, int]:
-    """Fetch a thread, dual-write each non-self-sent message. Returns counters."""
+    """Resolve anchors and dual-write each non-self-sent message. Returns counters.
+
+    Used by the per-cycle poller. Callers that already know the anchors
+    (e.g. the sync ``gmail_admin`` import path) should call
+    ``process_thread_messages`` directly instead.
+    """
+    submission_ids, contact_id = _resolve_thread_anchors(conn, user_id, thread_id)
+    if not submission_ids and contact_id is None:
+        logger.info(
+            "gmail_poller: thread has no live anchors, skipping",
+            extra={"user_id": user_id, "thread_id": thread_id},
+        )
+        return {
+            "responses_inserted": 0,
+            "responses_skipped:exists": 0,
+            "contact_outreach_inserted": 0,
+            "contact_outreach_skipped:exists": 0,
+            "skipped:self_sent": 0,
+        }
+
+    return process_thread_messages(
+        conn=conn,
+        service=service,
+        user_id=user_id,
+        thread_id=thread_id,
+        gmail_address=gmail_address,
+        submission_ids=submission_ids,
+        contact_id=contact_id,
+        classifications=classifications,
+        statuses=statuses,
+        email_method_id=email_method_id,
+        inbound_direction_id=inbound_direction_id,
+        archive_bucket=archive_bucket,
+    )
+
+
+def process_thread_messages(
+    *,
+    conn: Any,
+    service: Any,
+    user_id: int,
+    thread_id: str,
+    gmail_address: str,
+    submission_ids: list[int],
+    contact_id: int | None,
+    classifications: dict[str, int],
+    statuses: dict[str, int],
+    email_method_id: int,
+    inbound_direction_id: int,
+    archive_bucket: str,
+) -> dict[str, int]:
+    """Fetch a thread and dual-write each non-self-sent message.
+
+    The anchors (``submission_ids`` and ``contact_id``) are explicit —
+    no DB lookup happens inside this function, so callers can override
+    the "most-recent contact" heuristic the poller uses.
+
+    Pass ``archive_bucket=""`` to skip the S3 raw-bytes archive (used
+    by the sync gmail-link handler that has no S3 perms).
+    """
     counters = {
         "responses_inserted": 0,
         "responses_skipped:exists": 0,
@@ -533,14 +592,6 @@ def _process_thread(
         "contact_outreach_skipped:exists": 0,
         "skipped:self_sent": 0,
     }
-
-    submission_ids, contact_id = _resolve_thread_anchors(conn, user_id, thread_id)
-    if not submission_ids and contact_id is None:
-        logger.info(
-            "gmail_poller: thread has no live anchors, skipping",
-            extra={"user_id": user_id, "thread_id": thread_id},
-        )
-        return counters
 
     thread = (
         service.users()

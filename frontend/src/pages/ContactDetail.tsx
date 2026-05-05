@@ -90,12 +90,30 @@ export default function ContactDetail() {
   const [outNotes, setOutNotes] = useState('');
   const [logging, setLogging] = useState(false);
 
-  const [composeOpen, setComposeOpen] = useState(false);
+  // Compose-modal state. ``null`` = closed. ``{}`` = open in compose mode
+  // (fresh email). ``{ replyTo: ctx }`` = open in reply mode against an
+  // existing email-sourced outreach row.
+  const [composeOpen, setComposeOpen] = useState<{
+    replyTo?: {
+      gmail_message_id: string;
+      from_email: string | null;
+      subject: string | null;
+      body: string | null;
+      received_at: string | null;
+    };
+  } | null>(null);
   const [expandedEventIds, setExpandedEventIds] = useState<Set<number>>(
     new Set(),
   );
+  const [linkInput, setLinkInput] = useState('');
+  const [linkSaving, setLinkSaving] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [linkResult, setLinkResult] = useState<string | null>(null);
   const { status: gmailStatus } = useGmailStatus();
   const sendEnabled = hasSendScope(gmailStatus);
+  const gmailAvailable = Boolean(
+    gmailStatus && gmailStatus.available && gmailStatus.connected,
+  );
 
   const load = useCallback(async () => {
     try {
@@ -207,6 +225,39 @@ export default function ContactDetail() {
     }
   }
 
+  async function handleLinkThread(e: React.FormEvent) {
+    e.preventDefault();
+    if (!linkInput.trim()) return;
+    setLinkSaving(true);
+    setLinkError(null);
+    setLinkResult(null);
+    try {
+      const r = await apiFetch(`/contacts/${id}/gmail-link`, {
+        method: 'PUT',
+        body: JSON.stringify({ mid: linkInput }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text}`);
+      }
+      const result: { imported: number; 'skipped:exists': number } =
+        await r.json();
+      const newRows = result.imported ?? 0;
+      const dupes = result['skipped:exists'] ?? 0;
+      setLinkResult(
+        `Imported ${newRows} new ${newRows === 1 ? 'message' : 'messages'}` +
+          (dupes > 0 ? ` (${dupes} already on file)` : '') +
+          '.',
+      );
+      setLinkInput('');
+      await load();
+    } catch (err) {
+      setLinkError(String(err));
+    } finally {
+      setLinkSaving(false);
+    }
+  }
+
   function toggleEventExpanded(eventId: number) {
     setExpandedEventIds((prev) => {
       const next = new Set(prev);
@@ -232,7 +283,7 @@ export default function ContactDetail() {
             size="sm"
             variant="primary"
             className="ms-auto"
-            onClick={() => setComposeOpen(true)}
+            onClick={() => setComposeOpen({})}
           >
             Compose email
           </Button>
@@ -413,6 +464,53 @@ export default function ContactDetail() {
         </Card.Body>
       </Card>
 
+      {gmailAvailable && (
+        <Card className="mb-3">
+          <Card.Body>
+            <Card.Subtitle className="text-muted mb-2">
+              Import a Gmail thread
+            </Card.Subtitle>
+            <Form.Text className="text-muted d-block mb-2">
+              For conversations that started outside the app: paste any
+              Message-ID from the thread to import every message into
+              this contact's timeline. In Thunderbird:{' '}
+              <strong>Right-click → Organize → Copy Message Link</strong>.
+              In Gmail web: <strong>⋮ → Show original</strong>, then
+              copy the Message-ID line. The parser handles the
+              <code className="mx-1">mid:</code> URI form, bare IDs,
+              and pasted header blocks.
+            </Form.Text>
+            <Form onSubmit={handleLinkThread}>
+              <div className="d-flex gap-2">
+                <Form.Control
+                  type="text"
+                  placeholder="Paste Message-ID, mid: URI, or full header line…"
+                  value={linkInput}
+                  onChange={(e) => setLinkInput(e.target.value)}
+                  disabled={linkSaving}
+                />
+                <Button
+                  type="submit"
+                  disabled={linkSaving || !linkInput.trim()}
+                >
+                  {linkSaving ? 'Importing…' : 'Import'}
+                </Button>
+              </div>
+              {linkError && (
+                <Alert variant="danger" className="mt-2 mb-0">
+                  {linkError}
+                </Alert>
+              )}
+              {linkResult && (
+                <Alert variant="success" className="mt-2 mb-0">
+                  {linkResult}
+                </Alert>
+              )}
+            </Form>
+          </Card.Body>
+        </Card>
+      )}
+
       <h5 className="mt-4">Outreach history ({data.outreach_count})</h5>
       {data.outreach.length === 0 ? (
         <Card>
@@ -478,6 +576,25 @@ export default function ContactDetail() {
                           </span>
                         )}
                       </span>
+                      {sendEnabled && isEmail && evt.gmail_message_id && (
+                        <Button
+                          size="sm"
+                          variant="outline-primary"
+                          onClick={() =>
+                            setComposeOpen({
+                              replyTo: {
+                                gmail_message_id: evt.gmail_message_id!,
+                                from_email: evt.from_email,
+                                subject: evt.subject,
+                                body: evt.body_text,
+                                received_at: evt.outreach_at,
+                              },
+                            })
+                          }
+                        >
+                          Reply
+                        </Button>
+                      )}
                       <Button
                         variant="link"
                         size="sm"
@@ -554,14 +671,15 @@ export default function ContactDetail() {
       {composeOpen && (
         <GmailComposeModal
           show={true}
-          onHide={() => setComposeOpen(false)}
+          onHide={() => setComposeOpen(null)}
           defaultSubmissionId={null}
           defaultContactId={data.id}
           contactBannerLabel={data.name}
           defaultTo={data.email ?? ''}
+          replyTo={composeOpen.replyTo}
           defaultResumeId={null}
           onSent={() => {
-            setComposeOpen(false);
+            setComposeOpen(null);
             load();
           }}
           onNeedReconsent={() => {

@@ -669,6 +669,12 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /submissions/{id}/gmail-link
             Method: DELETE
+        LinkContactThread:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /contacts/{id}/gmail-link
+            Method: PUT
 
   # Gmail compose function — POST /messages/send. Sends a new message
   # (compose mode) or replies to an existing one (reply mode) via the

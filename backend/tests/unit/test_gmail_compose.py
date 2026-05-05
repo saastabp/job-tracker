@@ -465,23 +465,96 @@ class TestContactOnly:
         assert params[7] == "Hi Maria — saw your post about hiring SREs."
         assert params[8] == "user@gmail.com"
 
-    def test_reply_with_contact_only_rejected(
+    def test_reply_with_contact_only_resolves_thread_from_contact_outreach(
         self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
     ):
-        # Reply mode requires submission_id; contact-only reply isn't
-        # supported in v1.
-        out, _cursor, _send = self._run(
-            mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn,
-            body={
-                "to": ["maria@coldoutreach.com"],
-                "subject": "Re: Quick intro",
-                "body": "Sounds great!",
-                "contact_id": 11,
-                "in_reply_to_message_id": "gmail-msg-id-orig",
+        # Slice 10.5: reply with only contact_id resolves the thread from
+        # the contact's most-recent contact_outreach row.
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {  # gmail_credentials
+                "gmail_address": "user@gmail.com",
+                "refresh_token_ciphertext": b"\x01\x02ciph",
+                "scopes": _both_scopes(),
             },
+            {"id": 11},  # contact lookup
+            {"gmail_thread_id": "thread-existing"},  # contact_outreach lookup
+            _CATALOG_DIRECTION_OUTBOUND,
+            _CATALOG_METHOD_EMAIL,
+        ]
+        patched_conn("handlers.gmail_compose")
+        _mock_ssm(mocker, gmail_compose)
+        _mock_kms(mocker)
+        _service, send_call = _mock_google_libs(
+            mocker, gmail_compose, sent_thread_id="thread-existing",
+            in_reply_to_rfc="<orig@mail.gmail.com>",
+        )
+
+        out = gmail_compose.handler(
+            _auth_event(
+                body={
+                    "to": ["maria@coldoutreach.com"],
+                    "subject": "Re: Quick intro",
+                    "body": "Sounds great!",
+                    "contact_id": 11,
+                    "in_reply_to_message_id": "gmail-msg-id-orig",
+                }
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 200
+        # send body carries the resolved thread_id
+        send_kwargs = send_call.call_args.kwargs
+        assert send_kwargs["body"]["threadId"] == "thread-existing"
+
+        # Outbound contact_outreach row inserted with the same thread.
+        co_inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        assert len(co_inserts) == 1
+        assert co_inserts[0].args[1][4] == "thread-existing"
+
+    def test_reply_with_contact_with_no_thread_returns_400(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        # Reply mode where the contact has no contact_outreach row carrying
+        # a gmail_thread_id (e.g. only manually-logged outreach so far).
+        _set_env(monkeypatch)
+        gmail_compose = _import_fresh()
+
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {
+                "gmail_address": "user@gmail.com",
+                "refresh_token_ciphertext": b"\x01\x02ciph",
+                "scopes": _both_scopes(),
+            },
+            {"id": 11},  # contact ownership
+            None,        # contact_outreach lookup → no thread
+        ]
+        patched_conn("handlers.gmail_compose")
+        _mock_ssm(mocker, gmail_compose)
+        _mock_kms(mocker)
+        _mock_google_libs(mocker, gmail_compose)
+
+        out = gmail_compose.handler(
+            _auth_event(
+                body={
+                    "to": ["maria@coldoutreach.com"],
+                    "subject": "Re: Quick intro",
+                    "body": "Sounds great!",
+                    "contact_id": 11,
+                    "in_reply_to_message_id": "gmail-msg-id-orig",
+                }
+            ),
+            lambda_ctx,
         )
         assert out["statusCode"] == 400
-        assert "reply requires submission_id" in json.loads(out["body"])["error"]
+        assert "no linked thread" in json.loads(out["body"])["error"]
 
     def test_contact_not_found_returns_404(
         self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn

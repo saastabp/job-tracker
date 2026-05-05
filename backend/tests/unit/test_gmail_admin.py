@@ -388,6 +388,181 @@ class TestLinkThread:
 
 
 # ---------------------------------------------------------------------------
+# PUT /contacts/{id}/gmail-link — sync import a Gmail thread into a contact
+# ---------------------------------------------------------------------------
+
+
+class TestLinkContactThread:
+    def _stub_catalog_loader(self, mocker):
+        """Patch poller's catalog loader so the test doesn't need to mock the
+        four SELECTs ``_load_catalog_ids`` would otherwise issue."""
+        from handlers import gmail_poller
+
+        mocker.patch.object(
+            gmail_poller, "_load_catalog_ids",
+            return_value=({"other": 5}, {"applied": 1}, 81, 72),
+        )
+
+    def _stub_process(self, mocker, *, imported: int = 2, dupes: int = 0,
+                      self_sent: int = 0):
+        from handlers import gmail_poller
+
+        return mocker.patch.object(
+            gmail_poller, "process_thread_messages",
+            return_value={
+                "responses_inserted": 0,
+                "responses_skipped:exists": 0,
+                "contact_outreach_inserted": imported,
+                "contact_outreach_skipped:exists": dupes,
+                "skipped:self_sent": self_sent,
+            },
+        )
+
+    def test_happy_path_resolves_and_imports(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_admin = _import_fresh()
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},   # get_user_id
+            {"id": 11},   # contact ownership
+            {             # _build_service_for_user → gmail_credentials
+                "refresh_token_ciphertext": b"\x01\x02cipher",
+                "scopes": "https://www.googleapis.com/auth/gmail.readonly",
+            },
+            {"gmail_address": "user@gmail.com"},  # gmail_address lookup
+        ]
+        # SELECT submissions WHERE thread_id → fetchall returns []
+        mock_cursor.fetchall.return_value = []
+        patched_conn("handlers.gmail_admin")
+
+        _mock_ssm(mocker, gmail_admin)
+        _mock_kms(mocker)
+        _mock_google_libs(mocker, gmail_admin, thread_id="thread-cold-1")
+        self._stub_catalog_loader(mocker)
+        process_call = self._stub_process(mocker, imported=2, dupes=1)
+
+        out = gmail_admin.handler(
+            _auth_event(
+                "PUT /contacts/{id}/gmail-link",
+                body={"mid": "<abc-123@mail.gmail.com>"},
+                path_id=11,
+            ),
+            lambda_ctx,
+        )
+
+        assert out["statusCode"] == 200
+        body = json.loads(out["body"])
+        assert body["contact_id"] == 11
+        assert body["thread_id"] == "thread-cold-1"
+        assert body["imported"] == 2
+        assert body["skipped:exists"] == 1
+
+        # process_thread_messages was called with the explicit contact_id
+        # anchor (not the most-recent heuristic).
+        process_call.assert_called_once()
+        kwargs = process_call.call_args.kwargs
+        assert kwargs["contact_id"] == 11
+        assert kwargs["thread_id"] == "thread-cold-1"
+        assert kwargs["submission_ids"] == []
+        assert kwargs["archive_bucket"] == ""  # archive skipped
+
+    def test_contact_not_owned_returns_404(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_admin = _import_fresh()
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            None,        # contact not found / not owned
+        ]
+        patched_conn("handlers.gmail_admin")
+
+        out = gmail_admin.handler(
+            _auth_event(
+                "PUT /contacts/{id}/gmail-link",
+                body={"mid": "<abc@example.com>"},
+                path_id=999,
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 404
+        assert "contact not found" in json.loads(out["body"])["error"]
+
+    def test_gmail_not_connected_returns_400(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_admin = _import_fresh()
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},  # get_user_id
+            {"id": 11},  # contact ownership ok
+            None,        # gmail_credentials lookup → no row
+        ]
+        patched_conn("handlers.gmail_admin")
+        _mock_ssm(mocker, gmail_admin)
+
+        out = gmail_admin.handler(
+            _auth_event(
+                "PUT /contacts/{id}/gmail-link",
+                body={"mid": "<abc@example.com>"},
+                path_id=11,
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 400
+        assert "gmail not connected" in json.loads(out["body"])["error"]
+
+    def test_message_id_not_in_mailbox_returns_404(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_admin = _import_fresh()
+        mock_cursor.fetchone.side_effect = [
+            {"id": 42},
+            {"id": 11},
+            {
+                "refresh_token_ciphertext": b"\x01\x02cipher",
+                "scopes": "https://www.googleapis.com/auth/gmail.readonly",
+            },
+        ]
+        patched_conn("handlers.gmail_admin")
+        _mock_ssm(mocker, gmail_admin)
+        _mock_kms(mocker)
+        _mock_google_libs(mocker, gmail_admin, thread_id=None)
+
+        out = gmail_admin.handler(
+            _auth_event(
+                "PUT /contacts/{id}/gmail-link",
+                body={"mid": "<unknown@example.com>"},
+                path_id=11,
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 404
+        assert "not found" in json.loads(out["body"])["error"].lower()
+
+    def test_garbage_input_returns_400(
+        self, mocker, monkeypatch, lambda_ctx, mock_cursor, patched_conn
+    ):
+        _set_env(monkeypatch)
+        gmail_admin = _import_fresh()
+        mock_cursor.fetchone.return_value = {"id": 42}
+        patched_conn("handlers.gmail_admin")
+
+        out = gmail_admin.handler(
+            _auth_event(
+                "PUT /contacts/{id}/gmail-link",
+                body={"mid": "not a real message id"},
+                path_id=11,
+            ),
+            lambda_ctx,
+        )
+        assert out["statusCode"] == 400
+        assert "Message-ID" in json.loads(out["body"])["error"]
+
+
+# ---------------------------------------------------------------------------
 # DELETE /submissions/{id}/gmail-link
 # ---------------------------------------------------------------------------
 

@@ -28,8 +28,12 @@ def test_dashboard_today_shape(
     ]
     mock_cursor.fetchall.side_effect = [
         [
-            {"kind": "personal",  "today_count": 1, "week_count": 4},
-            {"kind": "recruiter", "today_count": 0, "week_count": 2},
+            {"kind": "personal",  "direction": "outbound",
+             "today_count": 1, "week_count": 4},
+            {"kind": "recruiter", "direction": "outbound",
+             "today_count": 0, "week_count": 2},
+            {"kind": "recruiter", "direction": "inbound",
+             "today_count": 1, "week_count": 3},
         ],
         [
             {"short_name": "submissions",       "cadence": "daily",  "goal": 5},
@@ -61,7 +65,13 @@ def test_dashboard_today_shape(
     assert m["personal_outreach"]["today"] == 1
     assert m["personal_outreach"]["week"] == 4
     assert m["personal_outreach"]["weekly"] == 10
+    assert m["personal_outreach"]["inbound_today"] == 0
+    assert m["personal_outreach"]["inbound_week"] == 0
     assert m["recruiter_outreach"]["today"] == 0
+    assert m["recruiter_outreach"]["week"] == 2
+    # The new inbound counters come through on a separate row.
+    assert m["recruiter_outreach"]["inbound_today"] == 1
+    assert m["recruiter_outreach"]["inbound_week"] == 3
     assert m["follow_ups"]["pending"] == 3
     # slice-03 addition: recent_submissions list.
     assert len(body["recent_submissions"]) == 1
@@ -89,17 +99,25 @@ def test_dashboard_empty_user(mocker, patched_conn, mock_cursor, auth_event, lam
     body = json.loads(resp["body"])
     m = body["metrics"]
     assert m["submissions"]   == {"today": 0, "week": 0, "daily": None, "weekly": None}
-    assert m["personal_outreach"]  == {"today": 0, "week": 0, "daily": None, "weekly": None}
-    assert m["recruiter_outreach"] == {"today": 0, "week": 0, "daily": None, "weekly": None}
+    assert m["personal_outreach"]  == {
+        "today": 0, "week": 0, "daily": None, "weekly": None,
+        "inbound_today": 0, "inbound_week": 0,
+    }
+    assert m["recruiter_outreach"] == {
+        "today": 0, "week": 0, "daily": None, "weekly": None,
+        "inbound_today": 0, "inbound_week": 0,
+    }
     assert m["follow_ups"] == {"pending": 0, "daily": None, "weekly": None}
     assert body["recent_submissions"] == []
 
 
-def test_outreach_query_filters_to_outbound(
+def test_outreach_query_groups_both_directions(
     mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
 ):
-    """Inbound outreach (e.g. an unsolicited recruiter ping) must not inflate
-    the user's outreach widgets. The dashboard counts outbound events only."""
+    """The outreach query reports both directions so the dashboard can
+    show outbound (goal-tracked) and inbound (informational) counts side
+    by side. Goal mechanics still only consider outbound — that's enforced
+    at the metric-population step, not in SQL."""
     from handlers import dashboard
 
     patched_conn("handlers.dashboard")
@@ -117,5 +135,10 @@ def test_outreach_query_filters_to_outbound(
     assert resp["statusCode"] == 200
     sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
     outreach_sql = next(s for s in sql_calls if "FROM contact_outreach" in s)
-    assert "outreach_directions od" in outreach_sql
-    assert "od.short_name = 'outbound'" in outreach_sql
+    # No direction filter — both 'outbound' and 'inbound' rows come back.
+    assert "od.short_name = 'outbound'" not in outreach_sql
+    # Project the direction column so the handler can branch per row.
+    assert "od.short_name AS direction" in outreach_sql
+    # GROUP BY must include direction, otherwise the SUMs would collapse
+    # both directions into a single row per kind.
+    assert "GROUP BY ck.short_name, od.short_name" in outreach_sql

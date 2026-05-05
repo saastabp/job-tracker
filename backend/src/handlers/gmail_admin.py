@@ -24,6 +24,16 @@ Routes
 ``DELETE /submissions/{id}/gmail-link``
     Clears ``submissions.gmail_thread_id``.
 
+``PUT /contacts/{id}/gmail-link``
+    Body: ``{ "mid": "..." }``. Resolves the pasted Message-ID to its
+    Gmail thread, then synchronously fetches every message in the
+    thread and dual-writes ``contact_outreach`` rows tagged to this
+    contact (and ``responses`` rows for any submission that already
+    has the same thread linked). Reuses the per-message processor
+    from ``handlers.gmail_poller``. Skips the S3 raw-bytes archive
+    (this Lambda doesn't have the gmail-stack bucket policy; the
+    parsed subject/body still land on the rows).
+
 All routes are Cognito-authenticated by the api stack's default JWT
 authorizer; no per-route auth overrides here.
 """
@@ -263,6 +273,106 @@ def _link_thread(
     return {"submission_id": submission_id, "thread_id": thread_id}
 
 
+def _link_contact_thread(
+    conn: Any, user_id: int, contact_id: int, body: dict[str, Any]
+) -> dict[str, Any]:
+    """Link a Gmail thread to a contact and synchronously import its messages.
+
+    Returns ``{contact_id, thread_id, imported}`` where ``imported`` is the
+    count of brand-new ``contact_outreach`` rows (existing rows from a
+    prior import / poll cycle are skipped via the unique key).
+    """
+    raw_input = body.get("mid", "") or ""
+    message_id = parse_message_id(raw_input)
+    if not message_id:
+        raise ValueError("could not extract Message-ID from input")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM contacts "
+            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (contact_id, user_id),
+        )
+        if not cur.fetchone():
+            raise LookupError("contact not found")
+
+    service = _build_service_for_user(conn, user_id)
+    if service is None:
+        raise ValueError("gmail not connected")
+
+    logger.info(
+        "gmail_admin: resolving Message-ID to thread (contact link)",
+        extra={
+            "user_id": user_id,
+            "contact_id": contact_id,
+            "message_id_prefix": message_id[:16],
+        },
+    )
+    thread_id = resolve_message_id_to_thread(service, message_id)
+    if thread_id is None:
+        raise LookupError("Message-ID not found in your gmail")
+
+    # Pull catalog ids + the user's gmail address (for self-sent filter).
+    # Defer the import until here so test fixtures don't need to mock the
+    # poller module at module-import time.
+    from handlers import gmail_poller
+
+    classifications, statuses, email_method_id, inbound_direction_id = (
+        gmail_poller._load_catalog_ids(conn)
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT gmail_address FROM gmail_credentials "
+            "WHERE user_id = %s AND deleted_at IS NULL",
+            (user_id,),
+        )
+        cred = cur.fetchone()
+    gmail_address = cred["gmail_address"] if cred else ""
+
+    # Discover any submissions that ALSO have this thread linked — their
+    # responses rows get filled in by the same loop.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM submissions "
+            "WHERE user_id = %s AND gmail_thread_id = %s "
+            "  AND deleted_at IS NULL",
+            (user_id, thread_id),
+        )
+        submission_ids = [int(r["id"]) for r in cur.fetchall()]
+
+    counters = gmail_poller.process_thread_messages(
+        conn=conn,
+        service=service,
+        user_id=user_id,
+        thread_id=thread_id,
+        gmail_address=gmail_address,
+        submission_ids=submission_ids,
+        contact_id=contact_id,
+        classifications=classifications,
+        statuses=statuses,
+        email_method_id=email_method_id,
+        inbound_direction_id=inbound_direction_id,
+        archive_bucket="",  # skip S3 archive; this Lambda lacks the policy
+    )
+
+    logger.info(
+        "gmail_admin: contact thread linked",
+        extra={
+            "user_id": user_id,
+            "contact_id": contact_id,
+            "thread_id": thread_id,
+            **counters,
+        },
+    )
+    return {
+        "contact_id": contact_id,
+        "thread_id": thread_id,
+        "imported": counters.get("contact_outreach_inserted", 0),
+        "skipped:exists": counters.get("contact_outreach_skipped:exists", 0),
+        "skipped:self_sent": counters.get("skipped:self_sent", 0),
+    }
+
+
 def _unlink_thread(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute(
@@ -300,6 +410,11 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
                 result = _link_thread(conn, user_id, _path_id(event), body)
             elif route_key == "DELETE /submissions/{id}/gmail-link":
                 result = _unlink_thread(conn, user_id, _path_id(event))
+            elif route_key == "PUT /contacts/{id}/gmail-link":
+                body = json.loads(event.get("body") or "{}")
+                result = _link_contact_thread(
+                    conn, user_id, _path_id(event), body
+                )
             else:
                 logger.warning(
                     "gmail_admin: unknown route", extra={"route_key": route_key}
