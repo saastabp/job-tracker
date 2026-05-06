@@ -379,8 +379,19 @@ def _insert_response_row(
 ) -> str:
     """Insert into ``responses`` and bump submission status if applicable.
 
-    Returns ``"inserted"`` on a successful new row, or ``"skipped:exists"``
-    when ``INSERT IGNORE`` matched the unique key on ``gmail_message_id``.
+    Uses ``INSERT ... ON DUPLICATE KEY UPDATE`` keyed on
+    ``uq_responses_gmail_message`` so a re-import of a Message-ID that
+    already has a row revives a soft-deleted entry (clears
+    ``deleted_at``) and refreshes the parsed content. Identity columns
+    (``submission_id``) are intentionally **not** in the UPDATE list —
+    re-importing the same message must not silently re-target it to a
+    different submission.
+
+    Returns ``"inserted"`` when the operation produced or revived a row
+    (MySQL ``rowcount`` of 1 or 2), or ``"skipped:exists"`` when an
+    existing live row already had identical content (rowcount 0). Status
+    bumping fires only on a true new insert (rowcount == 1) so a re-import
+    doesn't re-bump a status the user may have manually adjusted since.
     """
     classification_id = classifications.get(classification_short)
     if classification_id is None:
@@ -392,11 +403,19 @@ def _insert_response_row(
 
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT IGNORE INTO responses "
+            "INSERT INTO responses "
             "(submission_id, response_classification_id, received_at, "
             " from_email, subject, body_text, raw_email_s3_key, "
             " gmail_message_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "    deleted_at = NULL, "
+            "    response_classification_id = VALUES(response_classification_id), "
+            "    received_at = VALUES(received_at), "
+            "    from_email = VALUES(from_email), "
+            "    subject = VALUES(subject), "
+            "    body_text = VALUES(body_text), "
+            "    raw_email_s3_key = VALUES(raw_email_s3_key)",
             (
                 submission_id,
                 classification_id,
@@ -408,16 +427,19 @@ def _insert_response_row(
                 msg_id,
             ),
         )
-        inserted = cur.rowcount > 0
-        if not inserted:
+        affected = cur.rowcount
+        if affected == 0:
             logger.info(
-                "gmail_poller: response already present, skipping",
+                "gmail_poller: response already present (no-op), skipping",
                 extra={"submission_id": submission_id, "gmail_message_id": msg_id},
             )
             conn.commit()
             return "skipped:exists"
 
-        target_status_short = _STATUS_BUMP_MAP.get(classification_short)
+        is_brand_new = affected == 1
+        target_status_short = (
+            _STATUS_BUMP_MAP.get(classification_short) if is_brand_new else None
+        )
         if target_status_short:
             target_status_id = statuses.get(target_status_short)
             if target_status_id is None:
@@ -465,11 +487,26 @@ def _insert_contact_outreach_row(
     email_method_id: int,
     inbound_direction_id: int,
 ) -> str:
-    """Insert an inbound ``contact_outreach`` row. ``INSERT IGNORE`` for idempotency."""
+    """Insert an inbound ``contact_outreach`` row, idempotent on re-import.
+
+    Uses ``INSERT ... ON DUPLICATE KEY UPDATE`` keyed on
+    ``uq_contact_outreach_gmail_message`` so a re-import of a Message-ID
+    that already has a row revives a soft-deleted entry (clears
+    ``deleted_at``), refreshes parsed content, and **re-attaches the row
+    to the importing contact** (``contact_id``). The latter is what
+    makes "Import" on a contact's page authoritative — when the poller's
+    most-recent-contact heuristic guessed wrong, the user fixes it by
+    importing on the correct contact's page. ``user_id`` stays locked
+    out of the UPDATE list (cross-user boundary).
+
+    Returns ``"inserted"`` when the operation produced or revived a row
+    (MySQL ``rowcount`` of 1 or 2), or ``"skipped:exists"`` when an
+    existing live row already had identical content (rowcount 0).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT IGNORE INTO contact_outreach
+            INSERT INTO contact_outreach
                 (user_id, contact_id, outreach_at,
                  outreach_method_id, outreach_direction_id,
                  gmail_thread_id, gmail_message_id,
@@ -478,6 +515,16 @@ def _insert_contact_outreach_row(
                     %s, %s,
                     %s, %s,
                     %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                deleted_at = NULL,
+                contact_id = VALUES(contact_id),
+                outreach_at = VALUES(outreach_at),
+                outreach_method_id = VALUES(outreach_method_id),
+                outreach_direction_id = VALUES(outreach_direction_id),
+                gmail_thread_id = VALUES(gmail_thread_id),
+                subject = VALUES(subject),
+                body_text = VALUES(body_text),
+                from_email = VALUES(from_email)
             """,
             (
                 user_id, contact_id, received_at,
@@ -488,12 +535,12 @@ def _insert_contact_outreach_row(
                 from_email,
             ),
         )
-        inserted = cur.rowcount > 0
+        affected = cur.rowcount
         conn.commit()
 
-    if not inserted:
+    if affected == 0:
         logger.info(
-            "gmail_poller: contact_outreach row already present, skipping",
+            "gmail_poller: contact_outreach row already present (no-op), skipping",
             extra={
                 "contact_id": contact_id,
                 "gmail_message_id": msg_id,

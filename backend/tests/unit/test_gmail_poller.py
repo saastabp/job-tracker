@@ -9,7 +9,8 @@ Layers covered:
 
 1. Pure helpers (`classify`, `_extract_from_email`, `_extract_body_text`).
 2. ``_insert_response_row`` and ``_insert_contact_outreach_row`` —
-   the per-table write helpers, including INSERT IGNORE idempotency
+   the per-table write helpers, including INSERT...ON DUPLICATE KEY UPDATE
+   idempotency / soft-delete revival semantics
    and status-bump matrix.
 3. ``_process_thread`` — the dual-write orchestration: self-sent filter,
    per-submission response insert, most-recent-contact contact_outreach
@@ -381,7 +382,7 @@ class TestInsertResponseRow:
     ):
         _set_env(monkeypatch)
         gmail_poller = _import_fresh()
-        mock_cursor.rowcount = 0  # INSERT IGNORE matched the unique key
+        mock_cursor.rowcount = 0  # ON DUPLICATE KEY UPDATE was a no-op
 
         outcome = self._call(gmail_poller, conn=mock_conn)
         assert outcome == "skipped:exists"
@@ -390,6 +391,43 @@ class TestInsertResponseRow:
             if "UPDATE submissions SET submission_status_id" in c.args[0]
         ]
         assert len(update_calls) == 0
+
+    def test_revives_soft_deleted_row_on_duplicate_key(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        """Re-import of a soft-deleted response revives it; no status re-bump.
+
+        rowcount == 2 means MySQL applied the UPDATE clause (e.g. cleared
+        ``deleted_at`` or refreshed ``body_text``). We count it as
+        ``"inserted"`` so the import counter increments, but **skip the
+        status bump** — the user may have manually adjusted status since
+        the row was first created, and a re-import shouldn't undo that.
+        """
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        mock_cursor.rowcount = 2
+
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "inserted"
+
+        # Status-bump UPDATE must NOT fire on a revival.
+        update_calls = [
+            c for c in mock_cursor.execute.call_args_list
+            if "UPDATE submissions SET submission_status_id" in c.args[0]
+        ]
+        assert len(update_calls) == 0
+
+        inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO responses" in c.args[0]
+        ]
+        assert len(inserts) == 1
+        sql = inserts[0].args[0]
+        assert "ON DUPLICATE KEY UPDATE" in sql
+        assert "deleted_at = NULL" in sql
+        assert "body_text = VALUES(body_text)" in sql
+        update_clause = sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
+        assert "submission_id" not in update_clause
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +467,7 @@ class TestInsertContactOutreachRow:
 
         inserts = [
             c for c in mock_cursor.execute.call_args_list
-            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+            if "INSERT INTO contact_outreach" in c.args[0]
         ]
         assert len(inserts) == 1
         params = inserts[0].args[1]
@@ -453,6 +491,64 @@ class TestInsertContactOutreachRow:
         mock_cursor.rowcount = 0
         outcome = self._call(gmail_poller, conn=mock_conn)
         assert outcome == "skipped:exists"
+
+    def test_revives_soft_deleted_row_on_duplicate_key(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        """Re-import of a soft-deleted contact_outreach row revives it.
+
+        With ``INSERT ... ON DUPLICATE KEY UPDATE`` and a duplicate Gmail
+        message id, MySQL returns ``rowcount == 2`` when the UPDATE
+        clause changed any value (e.g. ``deleted_at`` from non-NULL to
+        NULL, or ``body_text`` from polluted to clean). Counted as
+        "inserted" so the user-facing import counter increments.
+        """
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        mock_cursor.rowcount = 2  # MySQL convention for duplicate-key UPDATE
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "inserted"
+
+        inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        assert len(inserts) == 1
+        # The UPDATE clause must clear deleted_at and refresh content.
+        sql = inserts[0].args[0]
+        assert "ON DUPLICATE KEY UPDATE" in sql
+        assert "deleted_at = NULL" in sql
+        assert "body_text = VALUES(body_text)" in sql
+        assert "subject = VALUES(subject)" in sql
+        # user_id must NOT be in the UPDATE list — that's a cross-user
+        # security boundary, not a usability nicety.
+        update_clause = sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
+        assert "user_id" not in update_clause
+
+    def test_re_import_re_attaches_to_importing_contact(
+        self, monkeypatch, mock_cursor, mock_conn
+    ):
+        """Re-importing on a contact's page re-targets the row to that contact.
+
+        The poller's auto-insert path picks "most-recent contact" via the
+        Fork 1 heuristic, which can guess wrong. The fix: explicit user
+        action ("Import" on contact X's page) wins. The UPDATE clause
+        must include ``contact_id = VALUES(contact_id)``.
+        """
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        mock_cursor.rowcount = 2
+
+        outcome = self._call(gmail_poller, conn=mock_conn)
+        assert outcome == "inserted"
+
+        inserts = [
+            c for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO contact_outreach" in c.args[0]
+        ]
+        sql = inserts[0].args[0]
+        update_clause = sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
+        assert "contact_id = VALUES(contact_id)" in update_clause
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +670,7 @@ class TestProcessThread:
 
         co_inserts = [
             c for c in mock_cursor.execute.call_args_list
-            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+            if "INSERT INTO contact_outreach" in c.args[0]
         ]
         assert len(co_inserts) == 0
 
@@ -602,7 +698,7 @@ class TestProcessThread:
 
         co_inserts = [
             c for c in mock_cursor.execute.call_args_list
-            if "INSERT IGNORE INTO contact_outreach" in c.args[0]
+            if "INSERT INTO contact_outreach" in c.args[0]
         ]
         assert len(co_inserts) == 1
         assert co_inserts[0].args[1][1] == 11  # contact_id
@@ -662,7 +758,7 @@ class TestProcessThread:
 
         mock_cursor.fetchall.side_effect = [[{"id": 7}]]
         mock_cursor.fetchone.return_value = {"contact_id": 11}
-        mock_cursor.rowcount = 0  # INSERT IGNORE matched on every write
+        mock_cursor.rowcount = 0  # duplicate-key UPDATE no-op on every write
 
         msg = _make_message()
         kwargs = self._common_kwargs(

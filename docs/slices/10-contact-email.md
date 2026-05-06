@@ -62,6 +62,52 @@ Already-stored polluted rows aren't backfilled automatically; users
 can delete the affected `contact_outreach` row and re-import via the
 Message-ID paste form to refresh.
 
+### Soft-delete + re-import revival
+
+After implementing the HTML-only body fix above, the user deleted the
+polluted `contact_outreach` row and re-imported via the Message-ID
+paste form, expecting to see the freshly-parsed body. Instead the
+import returned `imported 0 (1 already on file)`.
+
+Cause: the unique key `uq_contact_outreach_gmail_message` (and its
+sibling `uq_responses_gmail_message`) is a raw MySQL `UNIQUE` on
+`gmail_message_id` — it does not filter on `deleted_at`. A soft-deleted
+row keeps its message id, so `INSERT IGNORE` collides and the handler
+silently counts `skipped:exists`.
+
+Fix: replaced `INSERT IGNORE` with `INSERT … ON DUPLICATE KEY UPDATE`
+in both `_insert_contact_outreach_row` and `_insert_response_row`.
+The UPDATE clause:
+
+- Sets `deleted_at = NULL` (revives the soft-deleted row).
+- Refreshes the parsed-from-email columns (`subject`, `body_text`,
+  `from_email`, `outreach_at`, `gmail_thread_id`, plus
+  `raw_email_s3_key` and `response_classification_id` for responses).
+- For `contact_outreach`, **re-attaches the row to the importing
+  contact** via `contact_id = VALUES(contact_id)`. The user clicking
+  Import on a contact's page is an authoritative override of the
+  poller's "most-recent contact" Fork 1 heuristic. Without this, a
+  row first auto-attached by the poller to contact A would silently
+  stay on A even after the user explicitly re-imports on contact B,
+  and would never appear in B's timeline.
+- `user_id` is left out of the UPDATE list (cross-user security
+  boundary). For `_insert_response_row`, `submission_id` is also left
+  out — that helper is called in a loop over `submission_ids` for
+  threads linked to multiple submissions, and including it would
+  cause the row to bounce on the second iteration.
+
+Counter semantics: `rowcount == 1` (true insert) and `rowcount == 2`
+(MySQL convention for duplicate-key UPDATE that touched a row) both
+count as `"inserted"` — revival is what the user expects when they
+re-import. `rowcount == 0` (live row, identical content) keeps
+`"skipped:exists"`. For responses specifically, the status-bump
+UPDATE only fires on a true insert (rowcount 1) — re-imports must not
+re-bump a status the user may have manually adjusted since.
+
+Two regression tests added in `test_gmail_poller.py`:
+`test_revives_soft_deleted_row_on_duplicate_key` on each of
+`TestInsertResponseRow` and `TestInsertContactOutreachRow`.
+
 ### Deploy
 
 `make deploy-api && make sync-frontend` (no migration).
