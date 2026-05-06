@@ -1,6 +1,112 @@
-# Slice 10 — Contact-initiated email + unified compose (PLAN)
+# Slice 10 — Contact-initiated email + unified compose (SHIPPED)
 
-Status: forks locked, implementation underway. Branch: `slice/10-contact-email`.
+Status: shipped and verified end-to-end (2026-05-05). Branch: `slice/10-contact-email`.
+
+## Post-ship add-ons (2026-05-06)
+
+### Submission delete
+
+Real use case: user started logging a submission for a remote posting,
+went to apply, and the posting had been pulled by the employer. The app
+had no way to remove the row.
+
+Added a `DELETE /submissions/{id}` route + a Delete button on the
+submission detail page. Soft-deletes the submission row and cascades
+soft-deletes to `follow_ups`, `responses`, and `jd_snapshots`;
+hard-deletes `submission_contacts` junction rows; cancels EventBridge
+schedules for any auto-created follow-ups via `cancel_followup`. No
+schema change — every table involved already had `deleted_at` (or is a
+junction table by convention).
+
+### Standalone company create
+
+Companies were previously only creatable as a side-effect of the
+inline `company_name` on a submission, which meant a contact couldn't
+be associated with a company until an application had been logged
+for it. Added:
+
+- `frontend/src/components/NewCompanyModal.tsx` — small reusable modal
+  (name + notes) that POSTs to the existing `/companies` endpoint.
+- "New company" button on the Companies index page.
+- "+ Add new company…" sentinel option in the Company `<select>` on
+  both `ContactForm` (new contact) and `ContactDetail` (existing
+  contact). Selecting it opens the modal; on success the new company
+  is spliced into the local options list and auto-selected.
+
+No backend or schema changes — `POST /companies` already existed.
+
+### HTML-only email body extraction
+
+Importing a Thunderbird-originated thread (recruiter sent through an
+ATS that emits HTML-only, no plaintext sibling) stored a `body_text`
+that included the entire `<style>` block — hundreds of lines of
+`@import url(...)` and `.atsEmail{...}` CSS. Root cause: the
+fallback path in `gmail_poller._extract_body_text` ran
+`re.sub(r"<[^>]+>", " ", html)`, which only removes angle-bracket
+tags and leaves the contents of `<style>`/`<script>` blocks intact.
+
+Fixed by introducing `_html_to_text(html)`, which:
+
+1. Drops `<style>`/`<script>` blocks **with their contents** before any
+   tag-stripping.
+2. Replaces block-level tags (`<p>`, `<br>`, `<div>`, `<li>`, `<tr>`,
+   headings) with newlines so paragraph structure survives.
+3. Decodes HTML entities (`&nbsp;` / `&amp;` / `&#39;` / ...) via
+   `html.unescape`.
+4. Collapses runs of horizontal whitespace while preserving newlines.
+
+Two regression tests in `test_gmail_poller.py` cover the `<style>`
+case and entity decoding.
+
+Already-stored polluted rows aren't backfilled automatically; users
+can delete the affected `contact_outreach` row and re-import via the
+Message-ID paste form to refresh.
+
+### Deploy
+
+`make deploy-api && make sync-frontend` (no migration).
+
+## What actually landed
+
+Beyond the locked plan below, the following were folded in mid-slice:
+
+- **`/submissions` list now projects `gmail_thread_id`** — needed by
+  the modal's submission picker to filter out already-linked submissions.
+  Small additive change to `submissions._row_to_summary`.
+- **Slice-9 resumes-picker bug fix** — `GmailComposeModal` was reading
+  the resumes response as `{items: [...]}` but the handler returns a
+  bare array, so the picker was silently empty. One-liner fix.
+- **Sync gmail-thread import for contacts** —
+  `PUT /contacts/{id}/gmail-link`. Paste a Message-ID from any thread
+  message; the server resolves it via Gmail search, fetches the whole
+  thread, and dual-writes `contact_outreach` rows immediately (calls
+  the poller's `process_thread_messages` helper with explicit anchors
+  and `archive_bucket=""` to skip S3 — that Lambda lacks the gmail
+  bucket policy and parsed subject/body still land on the rows). New
+  card on `ContactDetail`.
+- **Reply-from-contact (originally a 10.5 candidate)** — lifted into
+  this slice because the user hit it the moment they imported a
+  contact-only thread. Reply mode now resolves the thread anchor from
+  `submissions.gmail_thread_id` OR (when only `contact_id` is set)
+  the contact's most-recent `contact_outreach.gmail_thread_id`. Reply
+  buttons added to email-sourced rows on `ContactDetail`.
+- **Dashboard inbound outreach counters** — surfaced inbound
+  `contact_outreach` rows alongside the goal-tracked outbound
+  counters. Added `inbound_today` / `inbound_week` to the dashboard
+  metric shape and a small "↓ N inbound" line on each outreach
+  ProgressTile. Goal mechanics (denominator) unchanged. The dashboard
+  outreach query no longer filters direction in SQL.
+
+## Deferred (deliberately, not regressions)
+
+- **Week picker** for dashboard/outreach history — see slice 11 plan.
+- **AI-tailored email body at compose time** — see slice 12 plan.
+- **Multi-contact thread granular tracking** — when N contacts share
+  a thread, current behavior is "most-recent contact_outreach row's
+  contact_id wins for inbound" (Fork 1 locked). A junction table for
+  N-contacts-per-message is the next step if requested.
+- **Bulk send** / **template / signature support** / **inbound
+  classification on contact_outreach rows**. None requested.
 
 ## Locked fork decisions (2026-05-05)
 

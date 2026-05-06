@@ -11,7 +11,7 @@ import {
   Badge,
 } from 'react-bootstrap';
 import Select from 'react-select';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { aiEnabled, useApi } from '../api/client';
 import { hasSendScope, useGmailStatus } from '../api/gmail';
 import GmailComposeModal from '../components/GmailComposeModal';
@@ -115,6 +115,7 @@ function normalizeDue(raw: string): string | null {
 
 export default function SubmissionDetail() {
   const apiFetch = useApi();
+  const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
   const [data, setData] = useState<SubmissionDetail | null>(null);
   const [resumes, setResumes] = useState<ResumeOption[]>([]);
@@ -149,6 +150,7 @@ export default function SubmissionDetail() {
   const [linkInput, setLinkInput] = useState('');
   const [linkSaving, setLinkSaving] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const { status: gmailStatus } = useGmailStatus();
   const sendEnabled = hasSendScope(gmailStatus);
   const gmailAvailable = Boolean(
@@ -455,6 +457,26 @@ export default function SubmissionDetail() {
     }
   }
 
+  async function handleDeleteSubmission() {
+    if (
+      !window.confirm(
+        'Delete this submission? Linked follow-ups, responses, and the JD snapshot will be removed too. This cannot be undone from the UI.',
+      )
+    ) {
+      return;
+    }
+    setDeleting(true);
+    setError(null);
+    try {
+      const r = await apiFetch(`/submissions/${id}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      navigate('/submissions');
+    } catch (e) {
+      setError(String(e));
+      setDeleting(false);
+    }
+  }
+
   async function handleUnlinkThread() {
     if (!window.confirm('Unlink this Gmail thread? Existing responses stay; new messages stop arriving.')) {
       return;
@@ -514,22 +536,31 @@ export default function SubmissionDetail() {
         <span className="ms-3">
           <StatusBadge status={data.status} />
         </span>
-        {sendEnabled && (
+        <div className="ms-auto d-flex gap-2">
+          {sendEnabled && (
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => setComposeOpen({})}
+              disabled={data.gmail_thread_id !== null}
+              title={
+                data.gmail_thread_id
+                  ? 'Submission already linked to a thread; reply from a response row instead'
+                  : undefined
+              }
+            >
+              Compose
+            </Button>
+          )}
           <Button
             size="sm"
-            variant="primary"
-            className="ms-auto"
-            onClick={() => setComposeOpen({})}
-            disabled={data.gmail_thread_id !== null}
-            title={
-              data.gmail_thread_id
-                ? 'Submission already linked to a thread; reply from a response row instead'
-                : undefined
-            }
+            variant="outline-danger"
+            onClick={handleDeleteSubmission}
+            disabled={deleting}
           >
-            Compose
+            {deleting ? 'Deleting…' : 'Delete'}
           </Button>
-        )}
+        </div>
       </div>
 
       {error && <Alert variant="danger">{error}</Alert>}

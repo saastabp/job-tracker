@@ -251,6 +251,53 @@ class TestHelpers:
         assert "<" not in result
         assert ">" not in result
 
+    def test_body_extraction_html_strips_style_block(self, monkeypatch):
+        """ATS-template regression: <style> contents must not leak into body_text.
+
+        A naive ``<[^>]+>`` tag-strip leaves CSS bodies in place because
+        the inner text contains no angle brackets. The fix drops the
+        whole ``<style>...</style>`` block before tag-stripping.
+        """
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        raw = (
+            b"<html><head><style>"
+            b"@import url('https://fonts.googleapis.com/css?family=Open+Sans');"
+            b".atsEmail{max-width:100%;padding:10px;}"
+            b"</style></head><body>"
+            b"<p>Role: Solutions Architect</p>"
+            b"<p>Location: REMOTE</p>"
+            b"</body></html>"
+        )
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": base64.urlsafe_b64encode(raw).decode("ascii")},
+        }
+        result = gmail_poller._extract_body_text(payload)
+        assert "Role: Solutions Architect" in result
+        assert "Location: REMOTE" in result
+        # CSS body is gone.
+        assert "atsEmail" not in result
+        assert "@import" not in result
+        assert "googleapis.com" not in result
+        # And the paragraph break survived the conversion.
+        assert "Solutions Architect" in result.split("\n")[0]
+        assert any("Location" in line for line in result.splitlines()[1:])
+
+    def test_body_extraction_html_decodes_entities(self, monkeypatch):
+        _set_env(monkeypatch)
+        gmail_poller = _import_fresh()
+        raw = b"<p>caf&eacute; &amp; tea&nbsp;party</p>"
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": base64.urlsafe_b64encode(raw).decode("ascii")},
+        }
+        result = gmail_poller._extract_body_text(payload)
+        assert "café" in result
+        assert "&amp;" not in result
+        assert "&nbsp;" not in result
+        assert "& tea" in result
+
 
 # ---------------------------------------------------------------------------
 # _insert_response_row

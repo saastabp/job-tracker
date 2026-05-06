@@ -15,9 +15,12 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../api/client';
 import { hasSendScope, useGmailStatus } from '../api/gmail';
 import GmailComposeModal from '../components/GmailComposeModal';
+import NewCompanyModal from '../components/NewCompanyModal';
 import { KindBadge } from './Contacts';
 import { KINDS, METHODS, DIRECTIONS } from './ContactForm';
 import { StatusBadge } from './Submissions';
+
+const NEW_COMPANY_SENTINEL = '__new__';
 
 interface OutreachEvent {
   id: number;
@@ -109,6 +112,7 @@ export default function ContactDetail() {
   const [linkSaving, setLinkSaving] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   const [linkResult, setLinkResult] = useState<string | null>(null);
+  const [showNewCompany, setShowNewCompany] = useState(false);
   const { status: gmailStatus } = useGmailStatus();
   const sendEnabled = hasSendScope(gmailStatus);
   const gmailAvailable = Boolean(
@@ -370,9 +374,18 @@ export default function ContactDetail() {
                 <Form.Label>Company</Form.Label>
                 <Form.Select
                   value={editCompanyId}
-                  onChange={(e) => setEditCompanyId(e.target.value)}
+                  onChange={(e) => {
+                    if (e.target.value === NEW_COMPANY_SENTINEL) {
+                      setShowNewCompany(true);
+                    } else {
+                      setEditCompanyId(e.target.value);
+                    }
+                  }}
                 >
                   <option value="">— none —</option>
+                  <option value={NEW_COMPANY_SENTINEL}>
+                    + Add new company…
+                  </option>
                   {companies.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
@@ -667,6 +680,20 @@ export default function ContactDetail() {
           </tbody>
         </Table>
       )}
+
+      <NewCompanyModal
+        show={showNewCompany}
+        onHide={() => setShowNewCompany(false)}
+        onCreated={(company) => {
+          setCompanies((prev) =>
+            [...prev, { id: company.id, name: company.name }].sort((a, b) =>
+              a.name.localeCompare(b.name),
+            ),
+          );
+          setEditCompanyId(String(company.id));
+          setShowNewCompany(false);
+        }}
+      />
 
       {composeOpen && (
         <GmailComposeModal

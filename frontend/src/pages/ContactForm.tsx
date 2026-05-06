@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Modal, Form, Button, Alert, Row, Col } from 'react-bootstrap';
 import { useApi } from '../api/client';
+import NewCompanyModal from '../components/NewCompanyModal';
+
+const NEW_COMPANY_SENTINEL = '__new__';
 
 export const KINDS: { short_name: string; label: string }[] = [
   { short_name: 'personal', label: 'Personal' },
@@ -50,6 +53,7 @@ export default function ContactForm({
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showNewCompany, setShowNewCompany] = useState(false);
 
   useEffect(() => {
     if (!show) return;
@@ -104,7 +108,8 @@ export default function ContactForm({
   }
 
   return (
-    <Modal show={show} onHide={onHide} size="lg">
+    <>
+      <Modal show={show} onHide={onHide} size="lg">
       <Form onSubmit={handleSubmit}>
         <Modal.Header closeButton>
           <Modal.Title>New contact</Modal.Title>
@@ -189,9 +194,18 @@ export default function ContactForm({
                 <Form.Label>Company</Form.Label>
                 <Form.Select
                   value={companyId}
-                  onChange={(e) => setCompanyId(e.target.value)}
+                  onChange={(e) => {
+                    if (e.target.value === NEW_COMPANY_SENTINEL) {
+                      setShowNewCompany(true);
+                    } else {
+                      setCompanyId(e.target.value);
+                    }
+                  }}
                 >
                   <option value="">— none —</option>
+                  <option value={NEW_COMPANY_SENTINEL}>
+                    + Add new company…
+                  </option>
                   {companies.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
@@ -222,6 +236,20 @@ export default function ContactForm({
           </Button>
         </Modal.Footer>
       </Form>
-    </Modal>
+      </Modal>
+      <NewCompanyModal
+        show={showNewCompany}
+        onHide={() => setShowNewCompany(false)}
+        onCreated={(company) => {
+          setCompanies((prev) =>
+            [...prev, { id: company.id, name: company.name }].sort((a, b) =>
+              a.name.localeCompare(b.name),
+            ),
+          );
+          setCompanyId(String(company.id));
+          setShowNewCompany(false);
+        }}
+      />
+    </>
   );
 }

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Table, Spinner, Alert, Card, Badge } from 'react-bootstrap';
+import { Table, Spinner, Alert, Card, Badge, Button } from 'react-bootstrap';
 import { Link } from 'react-router-dom';
 import { useApi } from '../api/client';
+import NewCompanyModal from '../components/NewCompanyModal';
 
 interface CompanyRow {
   id: number;
@@ -14,8 +15,9 @@ export default function Companies() {
   const apiFetch = useApi();
   const [rows, setRows] = useState<CompanyRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showNew, setShowNew] = useState(false);
 
-  useEffect(() => {
+  function load() {
     apiFetch('/companies')
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -23,19 +25,34 @@ export default function Companies() {
       })
       .then(setRows)
       .catch((e) => setError(String(e)));
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiFetch]);
 
   return (
     <>
-      <h3 className="mb-4">Companies</h3>
+      <div className="d-flex align-items-center mb-4">
+        <h3 className="mb-0">Companies</h3>
+        <Button
+          size="sm"
+          variant="primary"
+          className="ms-auto"
+          onClick={() => setShowNew(true)}
+        >
+          New company
+        </Button>
+      </div>
       {error && <Alert variant="danger">{error}</Alert>}
       {!rows ? (
         <Spinner animation="border" size="sm" />
       ) : rows.length === 0 ? (
         <Card>
           <Card.Body className="text-muted">
-            No companies yet. Companies are created automatically when you log a
-            submission.
+            No companies yet. Use “New company” above, or log a submission —
+            companies referenced inline on a submission are created automatically.
           </Card.Body>
         </Card>
       ) : (
@@ -64,6 +81,14 @@ export default function Companies() {
           </tbody>
         </Table>
       )}
+      <NewCompanyModal
+        show={showNew}
+        onHide={() => setShowNew(false)}
+        onCreated={() => {
+          setShowNew(false);
+          load();
+        }}
+      />
     </>
   );
 }

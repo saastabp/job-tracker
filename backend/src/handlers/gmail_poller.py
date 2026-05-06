@@ -40,6 +40,7 @@ schema for future use if quota becomes a concern.
 from __future__ import annotations
 
 import base64
+import html as _html
 import os
 import re
 from datetime import datetime, timezone
@@ -182,22 +183,57 @@ def _extract_from_email(headers: dict[str, str]) -> str:
 def _extract_body_text(payload: dict[str, Any]) -> str:
     """Walk the MIME tree and return the first text/plain part's text.
 
-    Falls back to text/html (stripped of tags) only if no text/plain
-    exists anywhere in the tree. Two-pass walk so a text/html part that
-    happens to appear before its sibling text/plain doesn't win — the
-    typical multipart/alternative email puts text/html first because
-    it's the "richer" representation, but we want the cleaner
-    classifier input.
+    Falls back to text/html (converted to plaintext) only if no
+    text/plain exists anywhere in the tree. Two-pass walk so a
+    text/html part that happens to appear before its sibling
+    text/plain doesn't win — the typical multipart/alternative email
+    puts text/html first because it's the "richer" representation, but
+    we want the cleaner classifier input.
     """
     plain = _find_part_text(payload, "text/plain")
     if plain:
         return plain
     html = _find_part_text(payload, "text/html")
     if html:
-        # Crude tag strip. Classifier patterns are word-based, so HTML
-        # entities and <tag> noise rarely trigger false matches.
-        return re.sub(r"<[^>]+>", " ", html)
+        return _html_to_text(html)
     return ""
+
+
+def _html_to_text(html: str) -> str:
+    """Best-effort HTML → plaintext for ATS-style HTML-only emails.
+
+    Three steps that matter for the stored body:
+
+    1. Drop ``<style>`` and ``<script>`` blocks **with their contents**.
+       A naive ``<[^>]+>`` tag-strip leaves CSS/JS bodies behind because
+       the regex matches angle brackets, not the tag's enclosed text;
+       ATS templates that ship CSS inline (no plaintext sibling) leak
+       hundreds of lines of ``.atsEmail{...}`` into ``body_text``.
+    2. Replace block-level tags (``<p>``, ``<div>``, ``<br>``, ``<li>``,
+       ``<tr>``, headings) with newlines before the tag-strip so the
+       plaintext keeps its paragraph structure.
+    3. Decode HTML entities (``&nbsp;`` / ``&amp;`` / ``&#39;`` / ...)
+       and collapse runs of horizontal whitespace, leaving newlines
+       intact.
+    """
+    text = re.sub(
+        r"<(style|script)\b[^>]*>.*?</\1>",
+        " ",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"<\s*(?:br|/?p|/?div|/?li|/?tr|/?h[1-6])\b[^>]*>",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _find_part_text(payload: dict[str, Any], target_mime: str) -> str:

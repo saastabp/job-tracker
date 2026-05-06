@@ -38,7 +38,7 @@ import boto3
 from common.auth import user_sub
 from common.db import get_connection
 from common.logger import logger
-from common.scheduler import schedule_followup
+from common.scheduler import cancel_followup, schedule_followup
 from common.users import get_user_id
 
 RESUME_BUCKET = os.environ.get("RESUME_BUCKET", "")
@@ -745,6 +745,92 @@ def _replace_contacts(
     return _detail(conn, user_id, submission_id)
 
 
+def _delete(conn: Any, user_id: int, submission_id: int) -> dict[str, Any]:
+    """Soft-delete a submission and cascade-clean its dependent rows.
+
+    Parameters
+    ----------
+    conn : pymysql.Connection
+        Active connection. Commits before returning.
+    user_id : int
+        Caller's row id; used to scope the ownership check.
+    submission_id : int
+        Target submission id.
+
+    Returns
+    -------
+    dict
+        ``{"id": submission_id, "deleted": True}`` on success.
+
+    Raises
+    ------
+    LookupError
+        Raised when the submission does not exist or is owned by a
+        different user. Surfaced as a 404 by the dispatcher.
+
+    Notes
+    -----
+    Mirrors the ``followups._delete`` shape: verify, mutate-in-txn, commit,
+    then best-effort scheduler cancellation. Soft-deletes ``follow_ups``,
+    ``responses``, and ``jd_snapshots`` (each carries a ``deleted_at``
+    column), and hard-deletes ``submission_contacts`` junction rows
+    (junction tables skip ``deleted_at`` per the project schema
+    convention). Any EventBridge schedules registered for follow-ups on
+    this submission are cancelled after the commit; ``cancel_followup``
+    swallows scheduler-API errors so a missing scheduler stack doesn't
+    break the delete.
+    """
+    _verify_submission(conn, user_id, submission_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM follow_ups "
+            "WHERE submission_id = %s AND deleted_at IS NULL",
+            (submission_id,),
+        )
+        follow_up_ids = [int(r["id"]) for r in cur.fetchall()]
+
+    logger.info(
+        "submissions.delete: soft-deleting",
+        extra={
+            "user_id": user_id,
+            "submission_id": submission_id,
+            "follow_up_count": len(follow_up_ids),
+        },
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE follow_ups SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE submission_id = %s AND deleted_at IS NULL",
+            (submission_id,),
+        )
+        cur.execute(
+            "UPDATE responses SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE submission_id = %s AND deleted_at IS NULL",
+            (submission_id,),
+        )
+        cur.execute(
+            "UPDATE jd_snapshots SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE submission_id = %s AND deleted_at IS NULL",
+            (submission_id,),
+        )
+        cur.execute(
+            "DELETE FROM submission_contacts WHERE submission_id = %s",
+            (submission_id,),
+        )
+        cur.execute(
+            "UPDATE submissions SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (submission_id, user_id),
+        )
+    conn.commit()
+
+    for fid in follow_up_ids:
+        cancel_followup(follow_up_id=fid)
+
+    return {"id": submission_id, "deleted": True}
+
+
 @logger.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     sub = user_sub(event)
@@ -767,6 +853,8 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             elif route_key == "PUT /submissions/{id}/contacts":
                 body = json.loads(event.get("body") or "{}")
                 result = _replace_contacts(conn, user_id, _path_id(event), body)
+            elif route_key == "DELETE /submissions/{id}":
+                result = _delete(conn, user_id, _path_id(event))
             else:
                 logger.warning("submissions: unknown route", extra={"route_key": route_key})
                 return _response(404, {"error": f"no handler for {route_key}"})

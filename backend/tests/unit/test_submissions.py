@@ -738,8 +738,97 @@ def test_unknown_route_returns_404(mocker, patched_conn, auth_event, lambda_ctx)
     mocker.patch("handlers.submissions.get_user_id", return_value=42)
 
     resp = submissions.handler(
-        auth_event("DELETE /submissions/{id}", path_id="1"),
+        auth_event("PATCH /submissions/{id}", path_id="1"),
         lambda_ctx,
     )
 
     assert resp["statusCode"] == 404
+
+
+def test_delete_submission_cascades_and_cancels_schedules(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """DELETE soft-deletes the submission + dependents and cancels schedules."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    cancel = mocker.patch("handlers.submissions.cancel_followup", return_value=True)
+
+    # Sequence:
+    #   1. _verify_submission           → fetchone → {"id": 99}
+    #   2. SELECT follow_ups ids        → fetchall → [{"id": 7}, {"id": 8}]
+    mock_cursor.fetchone.side_effect = [{"id": 99}]
+    mock_cursor.fetchall.side_effect = [[{"id": 7}, {"id": 8}]]
+
+    resp = submissions.handler(
+        auth_event("DELETE /submissions/{id}", path_id="99"),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body == {"id": 99, "deleted": True}
+
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    # Each dependent table got a soft-delete UPDATE.
+    assert any("UPDATE follow_ups SET deleted_at" in s for s in sql_calls)
+    assert any("UPDATE responses SET deleted_at" in s for s in sql_calls)
+    assert any("UPDATE jd_snapshots SET deleted_at" in s for s in sql_calls)
+    # Junction rows hard-deleted (no deleted_at on submission_contacts).
+    assert any("DELETE FROM submission_contacts" in s for s in sql_calls)
+    # The submission row itself soft-deleted with the ownership scope.
+    assert any(
+        "UPDATE submissions SET deleted_at" in s and "user_id" in s
+        for s in sql_calls
+    )
+
+    # cancel_followup fired once per follow-up id we found.
+    assert cancel.call_count == 2
+    cancelled_ids = sorted(c.kwargs["follow_up_id"] for c in cancel.call_args_list)
+    assert cancelled_ids == [7, 8]
+
+
+def test_delete_submission_not_found_returns_404(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    cancel = mocker.patch("handlers.submissions.cancel_followup")
+
+    # _verify_submission misses → LookupError → 404. No subsequent SQL fires.
+    mock_cursor.fetchone.return_value = None
+
+    resp = submissions.handler(
+        auth_event("DELETE /submissions/{id}", path_id="999"),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 404
+    cancel.assert_not_called()
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert not any("UPDATE submissions SET deleted_at" in s for s in sql_calls)
+
+
+def test_delete_submission_with_no_followups_skips_cancel(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    """A submission with no follow-ups deletes cleanly without scheduler calls."""
+    from handlers import submissions
+
+    patched_conn("handlers.submissions")
+    mocker.patch("handlers.submissions.get_user_id", return_value=42)
+    cancel = mocker.patch("handlers.submissions.cancel_followup")
+
+    mock_cursor.fetchone.side_effect = [{"id": 99}]
+    mock_cursor.fetchall.side_effect = [[]]  # no follow-ups
+
+    resp = submissions.handler(
+        auth_event("DELETE /submissions/{id}", path_id="99"),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    cancel.assert_not_called()
