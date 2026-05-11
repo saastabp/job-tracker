@@ -1,79 +1,12 @@
 # Slice 13 — Tailored PDF generation
 
-Status: backend + frontend code complete 2026-05-11 on
-`slice/13-tailored-pdf-generation`; **pending** user-run tests, deploy,
-the one-time master-PDF → JSON conversion, and visual fidelity compare
-before merge to `develop`.
+Status: **shipped 2026-05-11** on `slice/13-tailored-pdf-generation`,
+end-to-end through visual compare. Pending only commit + PR to `develop`.
 Branch: `slice/13-tailored-pdf-generation`.
 Depends on slice 11 (`docs/slices/11-week-picker.md`) shipped.
 
 Sequence note: slice 12 (AI email draft) is shelved indefinitely; this
-is the next slice after 11.
-
-## Resuming this slice (read this first)
-
-The code is on disk, uncommitted. Next-session opener: pick up at
-whichever step below is the next undone one.
-
-1. **Install new test deps** (one-time, in the repo's venv):
-   ```
-   pip install -e "backend/[dev]"
-   ```
-   This pulls in `fpdf2`, `pydantic` (was already transitively present),
-   and `pypdf` (dev-only). Confirm with `python -c "import fpdf, pypdf; print('ok')"`.
-
-2. **Run the new unit tests:**
-   ```
-   pytest backend/tests/unit/test_pdf_generator.py backend/tests/unit/test_resumes.py -v
-   ```
-   Expect 8 new tests in `test_pdf_generator.py` and 7 new under the
-   "Slice 13" header in `test_resumes.py`. If the renderer cases fail
-   on font registration, double-check `backend/src/common/fonts/`
-   contains the three `.ttf` files.
-
-3. **Frontend smoke** (optional but recommended before deploy):
-   ```
-   cd frontend && npm run dev
-   ```
-   On a submission detail page, the **Generate tailored PDF** button
-   should be disabled with a tooltip (`Master not yet parsed`) until
-   the master is parsed. On the master resume's detail page, the
-   warning banner should be visible.
-
-4. **Deploy in the required order** (per `feedback_migrate_after_deploy_api`):
-   ```
-   make -C infra deploy-api && make -C infra migrate && make -C infra sync-frontend
-   ```
-   `deploy-api` re-bundles `backend/src/` so the new migration is
-   visible; `migrate` runs `0009_resume_content_json.sql`;
-   `sync-frontend` ships the SPA changes through CloudFront.
-
-5. **One-time master-PDF → JSON conversion** (out of band — a fresh
-   Claude session is the easiest tool):
-   - Open a fresh session with the current master PDF
-     (`/home/brians/job-search/Brian Saastad-resume-eng.pdf`).
-   - Ask for output matching `ResumeContent`
-     (`backend/src/common/resume_schema.py`). The schema enforces
-     `extra="forbid"`, so any typo'd keys will 400 at PUT time.
-   - Save the JSON to a temp file.
-   - PUT it to the live API:
-     ```
-     curl -X PUT https://api.<host>/resumes/<master_id>/content -H "Authorization: Bearer <jwt>" -H "content-type: application/json" -d @master.json
-     ```
-   - Verify the resume-detail banner clears.
-
-6. **Manual visual compare:** tailor a real submission, click
-   "Generate tailored PDF", download, and diff against the master at
-   100% zoom. Where fidelity is off (side-rail columns, role-line
-   wrapping, section spacing), the fix is usually in
-   `common/resume_template.py` or a small tweak to the renderer's
-   row/section_header behavior. Re-render is free — just hit the
-   button again after redeploy.
-
-7. **Commit and PR** to `develop`. No slice 14 is planned at this
-   point; the queue is empty.
-
-## Why this slice
+is the next slice after 11. No slice 14 is currently planned.
 
 ## Implementation notes (2026-05-11)
 
@@ -120,20 +53,52 @@ What shipped and where it diverged from the plan above:
   `backend/pyproject.toml` so tests are runnable without manually
   syncing `requirements.txt`.
 
-## Open follow-ups before the slice fully closes
+## Visual-compare round (2026-05-11 PM)
 
-1. User runs `pip install -e backend/[dev]` and the new tests.
-2. `make -C infra deploy-api && make -C infra migrate && make -C infra sync-frontend` (per `feedback_migrate_after_deploy_api`).
-3. **One-time master conversion** (out of band): Claude session feeds
-   the current master PDF, emits JSON matching `ResumeContent`, user
-   PUTs it to `/resumes/{master_id}/content`.
-4. Manual end-to-end visual compare: tailor a real submission, diff the
-   rendered PDF against the master at 100% zoom. Fidelity here is
-   entirely a function of how cleanly the AI conversion captured the
-   master's structure — adjust the schema / template if obvious gaps
-   surface (e.g. side-rail columns, multi-line role titles).
-5. If the rendered output is good, this branch merges to develop and
-   no slice 14 is currently planned.
+First rendered tailored PDF showed three structural gaps vs. the master
+(captured in `docs/pdf-compare.png` mid-session). Fixed in a single
+template/renderer pass without re-deploying anything else:
+
+- **Header banner.** Added a new `banner` content-item type in
+  `pdf_generator.py`: full-width filled rectangle that overrides the
+  page top margin, with the name (white, bold, left) and contact lines
+  (white, right-aligned) vertically centered. Replaced the old centered
+  `**Name**` / contact / links text items in the template with a single
+  banner item.
+- **Navy section headers.** `_render_section_header` now sets
+  `text_color` (default = `DEFAULT_RULE_COLOR`, the same navy as the
+  rule) before drawing the heading, then resets. Removed the per-section
+  `size: 11` override and lifted it to `SECTION_SIZE = 14`.
+- **Bulleted side lists.** Areas of Expertise, Technical Proficiencies,
+  and Certifications now use `_bullets()` instead of the
+  no-glyph `_flat_list()`. The unused `_flat_list` helper was deleted.
+- **Job header navy + italic role.** `_render_row` and `_render_text`
+  both grew an optional `color` field. `_job_block` sets
+  `color = ACCENT_COLOR` on the company row and the role line, and
+  switched the role from `_text_` markdown (which fpdf2's parser
+  actually wants as `__text__`) to a clean `style: "I"` on the item.
+- **Body size + line spacing.** `BODY_SIZE = 11` (was 10), default line
+  height `1.35` (was `1.3`).
+
+Net: ~80% of the visual gap vs. the master closed without touching
+the schema, the `from-tailor` handler, or the SPA. Re-render is the
+"Generate tailored PDF" button — no redeploy needed beyond the initial
+`make -C infra deploy-api` after the changes above land.
+
+## Deferred follow-ups
+
+- **Disabled-button tooltip on `Generate tailored PDF`.** The button at
+  `frontend/src/pages/SubmissionDetail.tsx:744` uses the HTML `title`
+  attribute, but browsers don't fire `mouseover` on disabled buttons,
+  so the explanatory text (`Master not yet parsed — see resume detail.`
+  etc.) never shows. Fix is to wrap the `<Button>` in a `<span>` (which
+  *does* receive hover) and put the title on the wrapper, or move to a
+  react-bootstrap `<OverlayTrigger>` + `<Tooltip>`. Standalone change,
+  no backend impact — picked up in a future slice if/when it
+  matters.
+- **Two-column flat lists.** Master's "Areas of Expertise" wraps as a
+  two-column bulleted list; our render is single-column. Most code,
+  least visual impact of the three tiers; punted.
 
 ## Why this slice
 
