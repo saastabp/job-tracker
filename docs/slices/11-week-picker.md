@@ -297,8 +297,8 @@ in UTC).
 6. Frontend: new `OutreachHistory.tsx` page + router entry + nav
    item.
 7. Manual end-to-end on the live deploy.
-8. End-of-slice: write `docs/slices/13-tailored-pdf-generation.md`
-   plan (slice 12 shelved; slice 13 is next).
+8. ~~End-of-slice: write `docs/slices/13-tailored-pdf-generation.md`
+   plan (slice 12 shelved; slice 13 is next).~~ Done 2026-05-10.
 
 ## Resumption notes
 
