@@ -582,6 +582,18 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /resumes/{id}/purge
             Method: POST
+        SetResumeContent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/{id}/content
+            Method: PUT
+        ResumeFromTailor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /resumes/from-tailor
+            Method: POST
 
   # Gmail OAuth function — conditional on the gmail stack being deployed
   # (which publishes /jobtracker/gmail/kms-key-id, fetched by deploy-api

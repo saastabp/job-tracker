@@ -90,6 +90,7 @@ interface ResumeOption {
   title: string | null;
   summary: string | null;
   is_master: boolean;
+  has_content_json: boolean;
 }
 
 function defaultDueDate(): string {
@@ -132,6 +133,11 @@ export default function SubmissionDetail() {
   const [roleTitleDraft, setRoleTitleDraft] = useState('');
   const [tailorBusy, setTailorBusy] = useState(false);
   const [tailorMessage, setTailorMessage] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfMessage, setPdfMessage] = useState<string | null>(null);
+  const [tailoredDownloadUrl, setTailoredDownloadUrl] = useState<string | null>(
+    null,
+  );
   const [followUpBusyId, setFollowUpBusyId] = useState<number | null>(null);
   const [addFollowUpBusy, setAddFollowUpBusy] = useState(false);
   const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
@@ -190,6 +196,7 @@ export default function SubmissionDetail() {
             title: r.title,
             summary: r.summary,
             is_master: r.is_master,
+            has_content_json: Boolean(r.has_content_json),
           })),
         ),
       )
@@ -292,6 +299,73 @@ export default function SubmissionDetail() {
       setTailorMessage(`Tailoring failed: ${String(e)}`);
     } finally {
       setTailorBusy(false);
+    }
+  }
+
+  // Base resume for tailored-PDF rendering: prefer the submission's current
+  // resume_id, fall back to the user's master. The /resumes/from-tailor
+  // endpoint reads `content_json` off this row.
+  const baseResumeForPdf = useMemo<ResumeOption | null>(() => {
+    if (!data) return null;
+    if (data.resume_id != null) {
+      const explicit = resumes.find((r) => r.id === data.resume_id);
+      if (explicit) return explicit;
+    }
+    return resumes.find((r) => r.is_master) ?? null;
+  }, [data, resumes]);
+
+  const canGeneratePdf = Boolean(
+    baseResumeForPdf?.has_content_json &&
+      editTailoredTitle.trim() &&
+      editTailoredSummary.trim(),
+  );
+
+  const generatePdfDisabledReason = useMemo<string | null>(() => {
+    if (!baseResumeForPdf) return 'No base resume set on this submission yet.';
+    if (!baseResumeForPdf.has_content_json) {
+      return 'Master not yet parsed — see resume detail.';
+    }
+    if (!editTailoredTitle.trim() || !editTailoredSummary.trim()) {
+      return 'Tailored title and summary are required.';
+    }
+    return null;
+  }, [baseResumeForPdf, editTailoredTitle, editTailoredSummary]);
+
+  async function handleGeneratePdf() {
+    if (!data || !baseResumeForPdf) return;
+    setPdfMessage(null);
+    setTailoredDownloadUrl(null);
+    setPdfBusy(true);
+    try {
+      const r = await apiFetch('/resumes/from-tailor', {
+        method: 'POST',
+        body: JSON.stringify({
+          base_resume_id: baseResumeForPdf.id,
+          tailored_title: editTailoredTitle.trim(),
+          tailored_summary: editTailoredSummary.trim(),
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const newResume = await r.json();
+
+      const attach = await apiFetch(`/submissions/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ resume_id: newResume.id }),
+      });
+      if (!attach.ok) {
+        throw new Error(`HTTP ${attach.status}: ${await attach.text()}`);
+      }
+      const updated: SubmissionDetail = await attach.json();
+      setData(updated);
+
+      setTailoredDownloadUrl(newResume.download_url ?? null);
+      setPdfMessage(
+        `Tailored PDF generated and attached as resume #${newResume.id}.`,
+      );
+    } catch (e) {
+      setPdfMessage(`PDF generation failed: ${String(e)}`);
+    } finally {
+      setPdfBusy(false);
     }
   }
 
@@ -668,6 +742,15 @@ export default function SubmissionDetail() {
                   </Button>
                 )}
                 <Button
+                  variant="outline-primary"
+                  size="sm"
+                  onClick={handleGeneratePdf}
+                  disabled={pdfBusy || !canGeneratePdf}
+                  title={generatePdfDisabledReason ?? undefined}
+                >
+                  {pdfBusy ? 'Generating…' : 'Generate tailored PDF'}
+                </Button>
+                <Button
                   variant="outline-secondary"
                   size="sm"
                   onClick={addFollowUp}
@@ -683,6 +766,24 @@ export default function SubmissionDetail() {
               )}
               {tailorMessage && (
                 <div className="text-muted small mt-2">{tailorMessage}</div>
+              )}
+              {pdfMessage && (
+                <div className="text-muted small mt-2">
+                  {pdfMessage}
+                  {tailoredDownloadUrl && (
+                    <>
+                      {' '}
+                      <a
+                        href={tailoredDownloadUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Download
+                      </a>
+                      .
+                    </>
+                  )}
+                </div>
               )}
             </Card.Body>
           </Card>

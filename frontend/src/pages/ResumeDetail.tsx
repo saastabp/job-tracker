@@ -28,6 +28,7 @@ interface ResumeDetailData {
   summary: string | null;
   is_master: boolean;
   has_file: boolean;
+  has_content_json: boolean;
   original_filename: string | null;
   submission_count: number;
   download_url: string | null;
@@ -149,6 +150,15 @@ export default function ResumeDetail() {
       </div>
 
       {error && <Alert variant="danger">{error}</Alert>}
+
+      {data.is_master && !data.has_content_json && (
+        <Alert variant="warning" className="mb-3">
+          Tailoring unavailable — this master hasn&apos;t been parsed yet. Run
+          the one-time PDF&nbsp;→ JSON conversion and{' '}
+          <code>PUT /resumes/{data.id}/content</code> before generating tailored
+          PDFs from this resume.
+        </Alert>
+      )}
 
       <Row className="g-3 mb-3">
         <Col md={8}>

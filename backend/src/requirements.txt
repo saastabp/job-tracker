@@ -3,3 +3,5 @@ pymysql
 anthropic[bedrock]
 google-auth>=2.30
 google-api-python-client>=2.140
+fpdf2>=2.7
+pydantic>=2.6

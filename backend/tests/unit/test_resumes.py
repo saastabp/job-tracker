@@ -646,3 +646,260 @@ def test_unknown_route_returns_404(mocker, patched_conn, auth_event, lambda_ctx)
     )
 
     assert resp["statusCode"] == 404
+
+
+# ---------------------------------------------------------------------------
+# Slice 13: PUT /resumes/{id}/content and POST /resumes/from-tailor
+# ---------------------------------------------------------------------------
+
+_SAMPLE_CONTENT = {
+    "header": {"name": "Test User", "contact_line": "test@example.com"},
+    "areas_of_expertise": ["Cloud"],
+    "technical_proficiencies": ["AWS"],
+    "jobs": [
+        {
+            "company": "Acme",
+            "location": "Remote",
+            "dates": "2022 – Present",
+            "role": "Engineer",
+            "intro": "Did things.",
+            "accomplishments": [],
+        }
+    ],
+    "certifications": [],
+}
+
+
+def test_set_content_persists_validated_json(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    # The UPDATE succeeds; then _detail is called.
+    mock_cursor.rowcount = 1
+    detail_row = {
+        "id": 1, "title": "Master", "summary": "s",
+        "is_master": 1, "file_s3_key": None, "original_filename": None,
+        "created_at": None, "updated_at": None, "submission_count": 0,
+    }
+    mock_cursor.fetchone.side_effect = [detail_row]
+    mock_cursor.fetchall.side_effect = [[]]
+
+    resp = resumes.handler(
+        auth_event("PUT /resumes/{id}/content", path_id="1", body=_SAMPLE_CONTENT),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert any("UPDATE resumes SET content_json" in s for s in sql_calls)
+    # Confirm the persisted blob is a JSON string built from the validated model.
+    update_call = next(
+        c for c in mock_cursor.execute.call_args_list
+        if "content_json" in c.args[0]
+    )
+    serialized = update_call.args[1][0]
+    assert isinstance(serialized, str)
+    assert '"name": "Test User"' in serialized
+
+
+def test_set_content_invalid_payload_returns_400(
+    mocker, patched_conn, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+
+    resp = resumes.handler(
+        auth_event(
+            "PUT /resumes/{id}/content",
+            path_id="1",
+            body={"header": {"name": ""}},  # blank name → min_length violation
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 400
+    assert "invalid content_json" in json.loads(resp["body"])["error"]
+
+
+def test_set_content_not_owned_returns_404(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    mock_cursor.rowcount = 0
+
+    resp = resumes.handler(
+        auth_event("PUT /resumes/{id}/content", path_id="999", body=_SAMPLE_CONTENT),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 404
+
+
+def test_from_tailor_happy_path(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    s3 = mocker.patch.object(resumes, "_s3")
+
+    # Mock the PDF generator so the handler test does not depend on fpdf2.
+    fake_gen = mocker.MagicMock()
+    fake_gen.generate.return_value = b"%PDF-1.4\nfake-bytes"
+    mocker.patch.object(resumes, "PdfGenerator", return_value=fake_gen)
+
+    # Sequence of fetchone calls:
+    #   1. _read_base_content → row with content_json
+    #   2. _detail SELECT for the new tailored row
+    detail_row = {
+        "id": 7, "title": "Tailored Title", "summary": "Tailored summary.",
+        "is_master": 0, "file_s3_key": "users/user-sub-1/resumes/7/tailored.pdf",
+        "original_filename": "tailored.pdf",
+        "created_at": None, "updated_at": None, "submission_count": 0,
+    }
+    mock_cursor.fetchone.side_effect = [
+        {"content_json": json.dumps(_SAMPLE_CONTENT)},
+        detail_row,
+    ]
+    mock_cursor.fetchall.side_effect = [[]]  # _detail submissions list
+    type(mock_cursor).lastrowid = mocker.PropertyMock(return_value=7)
+
+    resp = resumes.handler(
+        auth_event(
+            "POST /resumes/from-tailor",
+            body={
+                "base_resume_id": 1,
+                "tailored_title": "Tailored Title",
+                "tailored_summary": "Tailored summary.",
+            },
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["id"] == 7
+
+    s3.put_object.assert_called_once()
+    put_kwargs = s3.put_object.call_args.kwargs
+    assert put_kwargs["Bucket"] == "test-bucket"
+    assert put_kwargs["Key"] == "users/user-sub-1/resumes/7/tailored.pdf"
+    assert put_kwargs["ContentType"] == "application/pdf"
+    assert put_kwargs["ServerSideEncryption"] == "AES256"
+    assert put_kwargs["Body"] == b"%PDF-1.4\nfake-bytes"
+
+    sql_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+    assert any("INSERT INTO resumes" in s for s in sql_calls)
+    assert any("UPDATE resumes SET file_s3_key" in s for s in sql_calls)
+
+
+def test_from_tailor_null_content_json_returns_409(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    mocker.patch.object(resumes, "_s3")
+    mocker.patch.object(resumes, "PdfGenerator")
+
+    mock_cursor.fetchone.return_value = {"content_json": None}
+
+    resp = resumes.handler(
+        auth_event(
+            "POST /resumes/from-tailor",
+            body={
+                "base_resume_id": 1,
+                "tailored_title": "T",
+                "tailored_summary": "S",
+            },
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 409
+    assert "content_json" in json.loads(resp["body"])["error"]
+
+
+def test_from_tailor_base_not_owned_returns_404(
+    mocker, patched_conn, mock_cursor, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    mocker.patch.object(resumes, "_s3")
+    mocker.patch.object(resumes, "PdfGenerator")
+
+    mock_cursor.fetchone.return_value = None
+
+    resp = resumes.handler(
+        auth_event(
+            "POST /resumes/from-tailor",
+            body={
+                "base_resume_id": 999,
+                "tailored_title": "T",
+                "tailored_summary": "S",
+            },
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 404
+
+
+def test_from_tailor_oversized_title_returns_400(
+    mocker, patched_conn, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    mocker.patch.object(resumes, "_s3")
+    mocker.patch.object(resumes, "PdfGenerator")
+
+    resp = resumes.handler(
+        auth_event(
+            "POST /resumes/from-tailor",
+            body={
+                "base_resume_id": 1,
+                "tailored_title": "x" * (resumes.MAX_TAILORED_TITLE_CHARS + 1),
+                "tailored_summary": "S",
+            },
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 400
+    assert "tailored_title too long" in json.loads(resp["body"])["error"]
+
+
+def test_from_tailor_missing_summary_returns_400(
+    mocker, patched_conn, auth_event, lambda_ctx,
+):
+    from handlers import resumes
+
+    patched_conn("handlers.resumes")
+    mocker.patch("handlers.resumes.get_user_id", return_value=42)
+    mocker.patch.object(resumes, "_s3")
+    mocker.patch.object(resumes, "PdfGenerator")
+
+    resp = resumes.handler(
+        auth_event(
+            "POST /resumes/from-tailor",
+            body={"base_resume_id": 1, "tailored_title": "T"},
+        ),
+        lambda_ctx,
+    )
+
+    assert resp["statusCode"] == 400
+    assert "tailored_summary" in json.loads(resp["body"])["error"]

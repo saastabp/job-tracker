@@ -8,6 +8,8 @@ GET    /resumes/{id}                 — detail + transient ``download_url`` if 
 PUT    /resumes/{id}                 — update title / summary / is_master
 DELETE /resumes/{id}                 — soft-delete (sets ``deleted_at``)
 POST   /resumes/{id}/upload-url      — request a fresh presigned PUT URL
+PUT    /resumes/{id}/content         — set the structured resume body (maintenance)
+POST   /resumes/from-tailor          — render a tailored PDF + insert resume row
 
 Upload flow
 -----------
@@ -31,13 +33,18 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import boto3
+from pydantic import ValidationError
 
 from common.auth import user_sub
 from common.db import get_connection
 from common.logger import logger
+from common.pdf_generator import PdfGenerator
+from common.resume_schema import ResumeContent
+from common.resume_template import build_template
 from common.users import get_user_id
 
 RESUME_BUCKET = os.environ.get("RESUME_BUCKET", "")
@@ -48,7 +55,22 @@ DOWNLOAD_URL_TTL_SECONDS = 300
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on PDF uploads.
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
 
+MAX_TAILORED_TITLE_CHARS = 300
+MAX_TAILORED_SUMMARY_CHARS = 4_000
+
+FONTS_DIR = str(Path(__file__).resolve().parent.parent / "common" / "fonts")
+TAILORED_FILENAME = "tailored.pdf"
+
 _s3 = boto3.client("s3", region_name=AWS_REGION)
+
+
+class _ConflictError(Exception):
+    """Raised when the request is well-formed but conflicts with current state.
+
+    Mapped to a 409 in the dispatcher. Used today for "base resume has no
+    content_json yet" — the user can fix it by PUT-ing the maintenance
+    endpoint, so 404 / 400 are both wrong.
+    """
 
 
 def _response(status: int, body: Any) -> dict[str, Any]:
@@ -77,6 +99,7 @@ def _row_to_summary(row: dict[str, Any]) -> dict[str, Any]:
         "summary": row["summary"],
         "is_master": bool(row["is_master"]),
         "has_file": row.get("file_s3_key") is not None,
+        "has_content_json": bool(row.get("has_content_json")),
         "original_filename": row.get("original_filename"),
         "submission_count": int(row.get("submission_count") or 0),
         "is_deleted": deleted_at is not None,
@@ -107,13 +130,15 @@ def _list(
             SELECT
                 r.id, r.title, r.summary, r.is_master,
                 r.file_s3_key, r.original_filename, r.deleted_at,
+                (r.content_json IS NOT NULL) AS has_content_json,
                 COUNT(s.id) AS submission_count
             FROM resumes r
             LEFT JOIN submissions s
                 ON s.resume_id = r.id AND s.deleted_at IS NULL
             WHERE {' AND '.join(where)}
             GROUP BY r.id, r.title, r.summary, r.is_master,
-                     r.file_s3_key, r.original_filename, r.deleted_at, r.updated_at
+                     r.file_s3_key, r.original_filename, r.deleted_at,
+                     r.content_json, r.updated_at
             ORDER BY (r.deleted_at IS NOT NULL) ASC,
                      r.is_master DESC, r.updated_at DESC, r.id DESC
             """,
@@ -196,6 +221,7 @@ def _detail(conn: Any, user_id: int, resume_id: int) -> dict[str, Any]:
                 r.id, r.title, r.summary, r.is_master,
                 r.file_s3_key, r.original_filename, r.deleted_at,
                 r.created_at, r.updated_at,
+                (r.content_json IS NOT NULL) AS has_content_json,
                 COUNT(s.id) AS submission_count
             FROM resumes r
             LEFT JOIN submissions s
@@ -203,7 +229,7 @@ def _detail(conn: Any, user_id: int, resume_id: int) -> dict[str, Any]:
             WHERE r.id = %s AND r.user_id = %s
             GROUP BY r.id, r.title, r.summary, r.is_master,
                      r.file_s3_key, r.original_filename, r.deleted_at,
-                     r.created_at, r.updated_at
+                     r.created_at, r.updated_at, r.content_json
             """,
             (resume_id, user_id),
         )
@@ -381,6 +407,178 @@ def _purge(conn: Any, user_id: int, resume_id: int) -> dict[str, Any]:
     return {"id": resume_id, "purged": True}
 
 
+def _set_content(
+    conn: Any, user_id: int, resume_id: int, body: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate ``body`` against ``ResumeContent`` and persist as JSON.
+
+    Maintenance-only endpoint — no SPA UI calls it. Validation errors map
+    to 400 via ``ValueError``; missing/not-owned rows map to 404.
+    """
+    logger.info(
+        "resumes.set_content: validating",
+        extra={"user_id": user_id, "resume_id": resume_id},
+    )
+    try:
+        content = ResumeContent.model_validate(body)
+    except ValidationError as e:
+        raise ValueError(f"invalid content_json: {e.errors()}") from e
+
+    serialized = json.dumps(content.model_dump(), ensure_ascii=False)
+    logger.info(
+        "resumes.set_content: persisting",
+        extra={
+            "user_id": user_id,
+            "resume_id": resume_id,
+            "content_bytes": len(serialized),
+        },
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE resumes SET content_json = %s "
+            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (serialized, resume_id, user_id),
+        )
+        if cur.rowcount == 0:
+            raise LookupError("resume not found")
+    conn.commit()
+    return _detail(conn, user_id, resume_id)
+
+
+def _read_base_content(
+    conn: Any, user_id: int, base_resume_id: int
+) -> ResumeContent:
+    """Load and validate ``content_json`` for the user's base resume.
+
+    Raises
+    ------
+    LookupError
+        Base resume row does not exist or is not owned by this user.
+    _ConflictError
+        Row exists but ``content_json`` is NULL — user must PUT a body
+        via the maintenance endpoint before tailoring is possible.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT content_json FROM resumes "
+            "WHERE id = %s AND user_id = %s AND deleted_at IS NULL",
+            (base_resume_id, user_id),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise LookupError("base resume not found")
+    raw = row.get("content_json")
+    if raw is None:
+        raise _ConflictError("base resume has no content_json")
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        parsed = json.loads(raw)
+    else:
+        parsed = raw
+    return ResumeContent.model_validate(parsed)
+
+
+def _from_tailor(
+    conn: Any,
+    user_id: int,
+    cognito_sub: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Render a tailored PDF from a base resume's ``content_json``.
+
+    Inserts a new ``is_master=False`` resume row, uploads the rendered
+    PDF to S3 with SSE-AES256, and returns the new row's detail JSON.
+    """
+    if not RESUME_BUCKET:
+        raise RuntimeError("RESUME_BUCKET env var not configured")
+
+    try:
+        base_resume_id = int(body.get("base_resume_id"))
+    except (TypeError, ValueError) as e:
+        raise ValueError("base_resume_id is required and must be an integer") from e
+    tailored_title = (body.get("tailored_title") or "").strip()
+    tailored_summary = (body.get("tailored_summary") or "").strip()
+    if not tailored_title:
+        raise ValueError("tailored_title is required")
+    if not tailored_summary:
+        raise ValueError("tailored_summary is required")
+    if len(tailored_title) > MAX_TAILORED_TITLE_CHARS:
+        raise ValueError(
+            f"tailored_title too long (max {MAX_TAILORED_TITLE_CHARS} chars)"
+        )
+    if len(tailored_summary) > MAX_TAILORED_SUMMARY_CHARS:
+        raise ValueError(
+            f"tailored_summary too long (max {MAX_TAILORED_SUMMARY_CHARS} chars)"
+        )
+
+    logger.info(
+        "resumes.from_tailor: loading base",
+        extra={"user_id": user_id, "base_resume_id": base_resume_id},
+    )
+    content = _read_base_content(conn, user_id, base_resume_id)
+
+    logger.info(
+        "resumes.from_tailor: rendering pdf",
+        extra={"user_id": user_id, "base_resume_id": base_resume_id},
+    )
+    template = build_template(content, tailored_title, tailored_summary)
+    generator = PdfGenerator(template, fonts_dir=FONTS_DIR)
+    pdf_bytes = bytes(
+        generator.generate(
+            {"tailored_title": tailored_title, "tailored_summary": tailored_summary}
+        )
+    )
+    logger.info(
+        "resumes.from_tailor: pdf rendered",
+        extra={
+            "user_id": user_id,
+            "base_resume_id": base_resume_id,
+            "pdf_bytes": len(pdf_bytes),
+        },
+    )
+
+    logger.info(
+        "resumes.from_tailor: inserting row",
+        extra={"user_id": user_id, "base_resume_id": base_resume_id},
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO resumes (user_id, title, summary, is_master) "
+            "VALUES (%s, %s, %s, FALSE)",
+            (user_id, tailored_title, tailored_summary),
+        )
+        new_id = int(cur.lastrowid)
+
+    key = f"users/{cognito_sub}/resumes/{new_id}/{TAILORED_FILENAME}"
+    logger.info(
+        "resumes.from_tailor: putting to s3",
+        extra={
+            "user_id": user_id,
+            "resume_id": new_id,
+            "s3_key": key,
+            "pdf_bytes": len(pdf_bytes),
+        },
+    )
+    _s3.put_object(
+        Bucket=RESUME_BUCKET,
+        Key=key,
+        Body=pdf_bytes,
+        ContentType="application/pdf",
+        ServerSideEncryption="AES256",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE resumes SET file_s3_key = %s, original_filename = %s "
+            "WHERE id = %s AND user_id = %s",
+            (key, TAILORED_FILENAME, new_id, user_id),
+        )
+    conn.commit()
+
+    return _detail(conn, user_id, new_id)
+
+
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -529,6 +727,12 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             elif route_key == "POST /resumes/{id}/upload-url":
                 body = json.loads(event.get("body") or "{}")
                 result = _upload_url(conn, user_id, sub, _path_id(event), body)
+            elif route_key == "PUT /resumes/{id}/content":
+                body = json.loads(event.get("body") or "{}")
+                result = _set_content(conn, user_id, _path_id(event), body)
+            elif route_key == "POST /resumes/from-tailor":
+                body = json.loads(event.get("body") or "{}")
+                result = _from_tailor(conn, user_id, sub, body)
             else:
                 logger.warning("resumes: unknown route", extra={"route_key": route_key})
                 return _response(404, {"error": f"no handler for {route_key}"})
@@ -540,6 +744,12 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             extra={"user_sub": sub, "route_key": route_key, "reason": str(e)},
         )
         return _response(404, {"error": str(e)})
+    except _ConflictError as e:
+        logger.warning(
+            "resumes: conflict",
+            extra={"user_sub": sub, "route_key": route_key, "reason": str(e)},
+        )
+        return _response(409, {"error": str(e)})
     except ValueError as e:
         logger.exception("resumes: bad request", extra={"user_sub": sub})
         return _response(400, {"error": str(e)})

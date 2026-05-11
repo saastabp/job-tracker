@@ -1,11 +1,139 @@
-# Slice 13 — Tailored PDF generation (PLAN)
+# Slice 13 — Tailored PDF generation
 
-Status: planned, decisions locked 2026-05-10, not yet started.
-Branch: `slice/13-tailored-pdf-generator` (already created).
+Status: backend + frontend code complete 2026-05-11 on
+`slice/13-tailored-pdf-generation`; **pending** user-run tests, deploy,
+the one-time master-PDF → JSON conversion, and visual fidelity compare
+before merge to `develop`.
+Branch: `slice/13-tailored-pdf-generation`.
 Depends on slice 11 (`docs/slices/11-week-picker.md`) shipped.
 
 Sequence note: slice 12 (AI email draft) is shelved indefinitely; this
 is the next slice after 11.
+
+## Resuming this slice (read this first)
+
+The code is on disk, uncommitted. Next-session opener: pick up at
+whichever step below is the next undone one.
+
+1. **Install new test deps** (one-time, in the repo's venv):
+   ```
+   pip install -e "backend/[dev]"
+   ```
+   This pulls in `fpdf2`, `pydantic` (was already transitively present),
+   and `pypdf` (dev-only). Confirm with `python -c "import fpdf, pypdf; print('ok')"`.
+
+2. **Run the new unit tests:**
+   ```
+   pytest backend/tests/unit/test_pdf_generator.py backend/tests/unit/test_resumes.py -v
+   ```
+   Expect 8 new tests in `test_pdf_generator.py` and 7 new under the
+   "Slice 13" header in `test_resumes.py`. If the renderer cases fail
+   on font registration, double-check `backend/src/common/fonts/`
+   contains the three `.ttf` files.
+
+3. **Frontend smoke** (optional but recommended before deploy):
+   ```
+   cd frontend && npm run dev
+   ```
+   On a submission detail page, the **Generate tailored PDF** button
+   should be disabled with a tooltip (`Master not yet parsed`) until
+   the master is parsed. On the master resume's detail page, the
+   warning banner should be visible.
+
+4. **Deploy in the required order** (per `feedback_migrate_after_deploy_api`):
+   ```
+   make -C infra deploy-api && make -C infra migrate && make -C infra sync-frontend
+   ```
+   `deploy-api` re-bundles `backend/src/` so the new migration is
+   visible; `migrate` runs `0009_resume_content_json.sql`;
+   `sync-frontend` ships the SPA changes through CloudFront.
+
+5. **One-time master-PDF → JSON conversion** (out of band — a fresh
+   Claude session is the easiest tool):
+   - Open a fresh session with the current master PDF
+     (`/home/brians/job-search/Brian Saastad-resume-eng.pdf`).
+   - Ask for output matching `ResumeContent`
+     (`backend/src/common/resume_schema.py`). The schema enforces
+     `extra="forbid"`, so any typo'd keys will 400 at PUT time.
+   - Save the JSON to a temp file.
+   - PUT it to the live API:
+     ```
+     curl -X PUT https://api.<host>/resumes/<master_id>/content -H "Authorization: Bearer <jwt>" -H "content-type: application/json" -d @master.json
+     ```
+   - Verify the resume-detail banner clears.
+
+6. **Manual visual compare:** tailor a real submission, click
+   "Generate tailored PDF", download, and diff against the master at
+   100% zoom. Where fidelity is off (side-rail columns, role-line
+   wrapping, section spacing), the fix is usually in
+   `common/resume_template.py` or a small tweak to the renderer's
+   row/section_header behavior. Re-render is free — just hit the
+   button again after redeploy.
+
+7. **Commit and PR** to `develop`. No slice 14 is planned at this
+   point; the queue is empty.
+
+## Why this slice
+
+## Implementation notes (2026-05-11)
+
+What shipped and where it diverged from the plan above:
+
+- **Fonts**: bundled three TTFs (Regular + Bold + **Italic**), not two.
+  The italic is needed for the role line in the job-header block (the
+  master uses C059-Roman italic; Noto Sans Italic stands in). Files live
+  under `backend/src/common/fonts/`, ~1.5 MB total.
+- **Renderer**: `common/pdf_generator.py` vendored from `looch` with
+  Google docstrings → NumPy, stdlib logging → powertools, S3 font-loader
+  removed entirely (mandatory bundled `fonts_dir`). Added content-item
+  types `row` (two-cell L/R baseline) and `section_header` (text +
+  accent rule). Default rule color is `(31, 73, 125)` — overrideable
+  per item via `rule_color`.
+- **Template**: `common/resume_template.py` exposes a single
+  `build_template(content, tailored_title, tailored_summary)` function.
+  Body sections are flattened at build time; only `{tailored_title}` and
+  `{tailored_summary}` stay as runtime placeholders for the renderer's
+  `data` dict. Long bullets wrap without hanging indent — accepted, swap
+  later if it looks bad.
+- **Schema**: `common/resume_schema.py` uses Pydantic v2 with
+  `extra="forbid"` on every model, so typo'd keys 400 at PUT time
+  instead of silently persisting.
+- **Handler additions**: `_set_content`, `_read_base_content`,
+  `_from_tailor`, plus `_ConflictError` mapped to HTTP 409 in the
+  dispatcher (used when the base resume's `content_json IS NULL`).
+- **Surfaced state**: `_list` and `_detail` now return
+  `has_content_json` (boolean derived via `content_json IS NOT NULL` in
+  SQL). The SPA reads this to enable/disable the "Generate tailored
+  PDF" button on submission detail and to show the "not parsed yet"
+  banner on resume detail.
+- **Base resume choice in the SPA**: the tailor button uses the
+  submission's current `resume_id` as the base; falls back to the
+  user's master if `resume_id IS NULL`. Matches the slice plan's
+  "uses whichever resume the submission already points to."
+- **Tests**: `backend/tests/unit/test_pdf_generator.py` is new (real
+  fpdf2 + pypdf round-trip, plus the four schema-rejection cases);
+  `test_resumes.py` grew seven cases covering PUT /content (happy /
+  400 / 404) and POST /from-tailor (happy / 409 / 404 / 400-oversize /
+  400-missing-summary). The /from-tailor handler test mocks
+  `PdfGenerator` so it stays fast and isolated.
+- **Pyproject**: `fpdf2`, `pydantic`, and (dev) `pypdf` added to
+  `backend/pyproject.toml` so tests are runnable without manually
+  syncing `requirements.txt`.
+
+## Open follow-ups before the slice fully closes
+
+1. User runs `pip install -e backend/[dev]` and the new tests.
+2. `make -C infra deploy-api && make -C infra migrate && make -C infra sync-frontend` (per `feedback_migrate_after_deploy_api`).
+3. **One-time master conversion** (out of band): Claude session feeds
+   the current master PDF, emits JSON matching `ResumeContent`, user
+   PUTs it to `/resumes/{master_id}/content`.
+4. Manual end-to-end visual compare: tailor a real submission, diff the
+   rendered PDF against the master at 100% zoom. Fidelity here is
+   entirely a function of how cleanly the AI conversion captured the
+   master's structure — adjust the schema / template if obvious gaps
+   surface (e.g. side-rail columns, multi-line role titles).
+5. If the rendered output is good, this branch merges to develop and
+   no slice 14 is currently planned.
 
 ## Why this slice
 
