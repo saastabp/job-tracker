@@ -24,6 +24,9 @@ from typing import Any
 from common.resume_schema import ResumeContent, ResumeJob
 
 BULLET_GLYPH = "•"
+BODY_SIZE = 11
+SECTION_SIZE = 14
+ACCENT_COLOR = (31, 73, 125)
 
 
 def _escape_markdown(text: str) -> str:
@@ -43,21 +46,13 @@ def _escape_markdown(text: str) -> str:
     return text.replace("\\", "\\\\").replace("*", "\\*").replace("_", "\\_")
 
 
-def _flat_list(items: list[str]) -> list[dict[str, Any]]:
-    """Render each entry as its own line. Empty list → no items emitted."""
-    return [
-        {"type": "text", "text": _escape_markdown(item), "size": 10}
-        for item in items
-    ]
-
-
 def _bullets(items: list[str]) -> list[dict[str, Any]]:
     """Render each entry prefixed with the bullet glyph."""
     return [
         {
             "type": "text",
             "text": f"{BULLET_GLYPH}  {_escape_markdown(item)}",
-            "size": 10,
+            "size": BODY_SIZE,
         }
         for item in items
     ]
@@ -77,7 +72,8 @@ def _job_block(job: ResumeJob) -> list[dict[str, Any]]:
             "type": "row",
             "left": left,
             "right": _escape_markdown(job.dates),
-            "size": 10,
+            "size": BODY_SIZE,
+            "color": ACCENT_COLOR,
         }
     )
 
@@ -85,8 +81,10 @@ def _job_block(job: ResumeJob) -> list[dict[str, Any]]:
         block.append(
             {
                 "type": "text",
-                "text": f"_{_escape_markdown(job.role)}_",
-                "size": 10,
+                "text": _escape_markdown(job.role),
+                "size": BODY_SIZE,
+                "style": "I",
+                "color": ACCENT_COLOR,
                 "after": 2,
             }
         )
@@ -96,7 +94,7 @@ def _job_block(job: ResumeJob) -> list[dict[str, Any]]:
             {
                 "type": "text",
                 "text": _escape_markdown(job.intro),
-                "size": 10,
+                "size": BODY_SIZE,
                 "after": 4,
             }
         )
@@ -108,7 +106,7 @@ def _job_block(job: ResumeJob) -> list[dict[str, Any]]:
             heading = f"**{name}** — {intro}"
         else:
             heading = f"**{name}**"
-        block.append({"type": "text", "text": heading, "size": 10})
+        block.append({"type": "text", "text": heading, "size": BODY_SIZE})
         block.extend(_bullets(accomplishment.bullets))
         block.append({"type": "text", "text": "", "size": 4, "after": 2})
 
@@ -144,75 +142,66 @@ def build_template(
     """
     items: list[dict[str, Any]] = []
 
+    contact_lines: list[str] = []
+    if content.header.contact_line:
+        contact_lines.append(_escape_markdown(content.header.contact_line))
+    for link in content.header.links:
+        contact_lines.append(_escape_markdown(link))
+
     items.append(
         {
-            "type": "text",
-            "text": f"**{_escape_markdown(content.header.name)}**",
-            "size": 20,
-            "align": "C",
+            "type": "banner",
+            "name": _escape_markdown(content.header.name),
+            "contact_lines": contact_lines,
+            "name_size": 22,
+            "line_size": 9,
+            "after": 10,
         }
     )
+
     items.append(
         {
             "type": "text",
             "text": "{tailored_title}",
-            "size": 12,
+            "size": 13,
             "align": "C",
-            "after": 4,
+            "style": "B",
+            "color": ACCENT_COLOR,
+            "after": 10,
         }
     )
-    if content.header.contact_line:
-        items.append(
-            {
-                "type": "text",
-                "text": _escape_markdown(content.header.contact_line),
-                "size": 9,
-                "align": "C",
-            }
-        )
-    if content.header.links:
-        joined = "   ".join(_escape_markdown(link) for link in content.header.links)
-        items.append(
-            {
-                "type": "text",
-                "text": joined,
-                "size": 9,
-                "align": "C",
-                "after": 8,
-            }
-        )
 
-    items.append({"type": "section_header", "text": "Professional Summary", "size": 11})
+    items.append({"type": "section_header", "text": "Professional Summary", "size": SECTION_SIZE})
     items.append(
-        {"type": "text", "text": "{tailored_summary}", "size": 10, "after": 6}
+        {"type": "text", "text": "{tailored_summary}", "size": BODY_SIZE, "after": 6}
     )
 
     if content.areas_of_expertise:
         items.append(
-            {"type": "section_header", "text": "Areas of Expertise", "size": 11}
+            {"type": "section_header", "text": "Areas of Expertise", "size": SECTION_SIZE}
         )
-        items.extend(_flat_list(content.areas_of_expertise))
+        items.extend(_bullets(content.areas_of_expertise))
         items.append({"type": "text", "text": "", "size": 4, "after": 2})
 
     if content.technical_proficiencies:
         items.append(
-            {"type": "section_header", "text": "Technical Proficiencies", "size": 11}
+            {"type": "section_header", "text": "Technical Proficiencies", "size": SECTION_SIZE}
         )
-        items.extend(_flat_list(content.technical_proficiencies))
+        items.extend(_bullets(content.technical_proficiencies))
         items.append({"type": "text", "text": "", "size": 4, "after": 2})
 
     if content.jobs:
         items.append(
-            {"type": "section_header", "text": "Professional Experience", "size": 11}
+            {"type": "section_header", "text": "Professional Experience", "size": SECTION_SIZE}
         )
         for job in content.jobs:
             items.extend(_job_block(job))
 
     if content.certifications:
         items.append(
-            {"type": "section_header", "text": "Certifications", "size": 11}
+            {"type": "section_header", "text": "Certifications", "size": SECTION_SIZE}
         )
-        items.extend(_flat_list(content.certifications))
+        items.extend(_bullets(content.certifications))
 
     return {
         "page": {
@@ -228,7 +217,7 @@ def build_template(
             "bold": "NotoSans-Bold.ttf",
             "italic": "NotoSans-Italic.ttf",
         },
-        "default_font_size": 10,
-        "default_line_height": 1.3,
+        "default_font_size": BODY_SIZE,
+        "default_line_height": 1.35,
         "content": items,
     }

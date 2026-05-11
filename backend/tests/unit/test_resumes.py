@@ -751,6 +751,7 @@ def test_from_tailor_happy_path(
     patched_conn("handlers.resumes")
     mocker.patch("handlers.resumes.get_user_id", return_value=42)
     s3 = mocker.patch.object(resumes, "_s3")
+    s3.generate_presigned_url.return_value = "https://signed-get/example"
 
     # Mock the PDF generator so the handler test does not depend on fpdf2.
     fake_gen = mocker.MagicMock()

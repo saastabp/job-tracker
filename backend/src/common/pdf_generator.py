@@ -134,6 +134,10 @@ class PdfGenerator:
                 self._render_section_header(
                     pdf, item, data, font_family, default_size, default_line_height
                 )
+            elif item_type == "banner":
+                self._render_banner(
+                    pdf, item, data, font_family, default_size, default_line_height
+                )
             else:
                 raise ValueError(f"unknown content item type: {item_type!r}")
 
@@ -181,9 +185,12 @@ class PdfGenerator:
         align = item.get("align", "L")
         line_height = size * item.get("line_height", default_line_height)
         style = item.get("style", "")
+        color = item.get("color")
 
         text = item["text"].format(**data)
 
+        if color is not None:
+            pdf.set_text_color(*color)
         pdf.set_font(font_family, style=style, size=size)
         pdf.multi_cell(
             w=0,
@@ -194,6 +201,8 @@ class PdfGenerator:
             new_x="LMARGIN",
             new_y="NEXT",
         )
+        if color is not None:
+            pdf.set_text_color(0, 0, 0)
 
     def _render_row(
         self,
@@ -215,6 +224,7 @@ class PdfGenerator:
         size = item.get("size", default_size)
         line_height = size * item.get("line_height", default_line_height)
         style = item.get("style", "")
+        color = item.get("color")
 
         left = item.get("left", "").format(**data)
         right = item.get("right", "").format(**data)
@@ -222,6 +232,8 @@ class PdfGenerator:
         usable = pdf.w - pdf.l_margin - pdf.r_margin
         half = usable / 2
 
+        if color is not None:
+            pdf.set_text_color(*color)
         pdf.set_font(font_family, style=style, size=size)
         pdf.cell(
             w=half,
@@ -241,6 +253,8 @@ class PdfGenerator:
             new_x="LMARGIN",
             new_y="NEXT",
         )
+        if color is not None:
+            pdf.set_text_color(0, 0, 0)
 
     def _render_section_header(
         self,
@@ -253,16 +267,20 @@ class PdfGenerator:
     ) -> None:
         """Render heading text in bold, then draw a horizontal rule under it.
 
-        Honors per-item ``rule_color`` (``(r, g, b)``) and ``rule_width``
-        (points); falls back to module-level defaults.
+        Honors per-item ``text_color``, ``rule_color`` (both ``(r, g, b)``)
+        and ``rule_width`` (points); falls back to module-level defaults.
+        Text color defaults to the same accent as the rule so headings and
+        rules read as a single styled unit.
         """
         size = item.get("size", default_size)
         align = item.get("align", "L")
         line_height = size * item.get("line_height", default_line_height)
         style = item.get("style", "B")
+        text_color = item.get("text_color", DEFAULT_RULE_COLOR)
 
         text = item["text"].format(**data)
 
+        pdf.set_text_color(*text_color)
         pdf.set_font(font_family, style=style, size=size)
         pdf.multi_cell(
             w=0,
@@ -273,6 +291,7 @@ class PdfGenerator:
             new_x="LMARGIN",
             new_y="NEXT",
         )
+        pdf.set_text_color(0, 0, 0)
 
         rule_color = item.get("rule_color", DEFAULT_RULE_COLOR)
         rule_width = item.get("rule_width", DEFAULT_RULE_WIDTH_PT)
@@ -285,3 +304,62 @@ class PdfGenerator:
         pdf.set_line_width(rule_width)
         pdf.line(x1, y, x2, y)
         pdf.set_y(y + rule_width)
+
+    def _render_banner(
+        self,
+        pdf: FPDF,
+        item: dict[str, Any],
+        data: dict[str, Any],
+        font_family: str,
+        default_size: float,
+        default_line_height: float,
+    ) -> None:
+        """Render a full-width colored banner with name (left) and contact lines (right).
+
+        Designed as the top-of-page header for a resume: the banner spans
+        the page edge-to-edge, overriding the page's top margin. The name
+        renders bold-left at ``name_size``; ``contact_lines`` render right-
+        aligned, one line each, at ``line_size``. Both blocks are
+        vertically centered against the taller column.
+
+        After rendering, the cursor sits at ``y = banner_h`` with
+        ``x = l_margin`` so the next content item flows below.
+        """
+        bg_color = item.get("bg_color", DEFAULT_RULE_COLOR)
+        text_color = item.get("text_color", (255, 255, 255))
+        name = item["name"].format(**data)
+        contact_lines = [s.format(**data) for s in item.get("contact_lines", [])]
+        name_size = item.get("name_size", 22)
+        line_size = item.get("line_size", 9)
+        padding_y = item.get("padding_y", 12)
+
+        name_h = name_size * 1.15
+        line_h = line_size * 1.25
+        contact_block_h = len(contact_lines) * line_h
+        banner_h = max(name_h, contact_block_h) + 2 * padding_y
+
+        page_w = pdf.w
+
+        pdf.set_fill_color(*bg_color)
+        pdf.rect(x=0, y=0, w=page_w, h=banner_h, style="F")
+
+        pdf.set_text_color(*text_color)
+
+        block_center_y = banner_h / 2
+        name_y = block_center_y - name_h / 2
+        name_x = pdf.l_margin
+        name_w = (page_w / 2) - name_x
+        pdf.set_xy(name_x, name_y)
+        pdf.set_font(font_family, style="B", size=name_size)
+        pdf.cell(w=name_w, h=name_h, text=name, align="L")
+
+        right_x = page_w / 2
+        right_w = page_w - right_x - pdf.r_margin
+        contact_y = block_center_y - contact_block_h / 2
+        pdf.set_font(font_family, style="", size=line_size)
+        for i, line in enumerate(contact_lines):
+            pdf.set_xy(right_x, contact_y + i * line_h)
+            pdf.cell(w=right_w, h=line_h, text=line, align="R")
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_xy(pdf.l_margin, banner_h)
