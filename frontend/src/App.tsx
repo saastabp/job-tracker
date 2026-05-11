@@ -12,6 +12,7 @@ import Resumes from './pages/Resumes';
 import ResumeDetail from './pages/ResumeDetail';
 import Contacts from './pages/Contacts';
 import ContactDetail from './pages/ContactDetail';
+import OutreachHistory from './pages/OutreachHistory';
 import FollowUps from './pages/FollowUps';
 import Health from './pages/Health';
 import Login from './pages/Login';
@@ -48,6 +49,7 @@ export default function App() {
           <Route path="resumes/:id" element={<ResumeDetail />} />
           <Route path="contacts" element={<Contacts />} />
           <Route path="contacts/:id" element={<ContactDetail />} />
+          <Route path="outreach" element={<OutreachHistory />} />
           <Route path="follow-ups" element={<FollowUps />} />
           <Route path="targets" element={<Targets />} />
           <Route path="settings" element={<Settings />} />

@@ -224,6 +224,33 @@ Resources:
             Path: /dashboard/today
             Method: GET
 
+  OutreachHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: jobtracker-outreach-history
+      CodeUri: ../../backend/src
+      Handler: handlers.outreach_history.handler
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbEndpoint
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          POWERTOOLS_SERVICE_NAME: jobtracker
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-db:connect
+              Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbUser}'
+      Events:
+        GetOutreachHistory:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /outreach/history
+            Method: GET
+
   CompaniesFunction:
     Type: AWS::Serverless::Function
     Properties:

@@ -1,7 +1,13 @@
 # Slice 11 — Week picker for dashboard + outreach history (PLAN)
 
-Status: planned, not started. Branch: `slice/11-week-picker` (TBD).
+Status: planned, forks decided 2026-05-10, not yet started.
+Branch: `slice/11-week-picker` (TBD).
 Depends on slice 10 (`docs/slices/10-contact-email.md`) shipped.
+
+Sequence note: originally next after slice 10 was to be slice 12 (AI
+email draft). Slice 12 is shelved indefinitely; slice 11 now runs
+ahead of slice 13 (tailored-PDF generation) — both will land on
+develop in that order.
 
 ## Why this slice
 
@@ -43,7 +49,19 @@ because they share the same week-picker primitive.
   starts at UTC Monday 00:00.
 - **Default = current week** when the param is absent.
 
-## Forks the user needs to decide
+## Forks (decided 2026-05-10)
+
+Summary of decisions, in order:
+
+| Fork | Decision |
+|---|---|
+| 1. Where the week-picker UI lives | **Dashboard + new "Outreach history" page** |
+| 2. "Today" tile on past weeks | **Hide entirely** |
+| 3. Submissions vs. outreach in history view | **Outreach only for v1** |
+| 4. Pagination strategy | **One week at a time** |
+| 5. Dashboard counter headers on past weeks | **Re-label dynamically** |
+
+Detail and rationale on each below.
 
 ### Fork 1 — Where the week-picker UI lives
 
@@ -269,7 +287,7 @@ in UTC).
 
 ## Starter task list
 
-1. User decides forks 1–5.
+1. ~~User decides forks 1–5.~~ Done 2026-05-10 (see Forks section above).
 2. Backend: parameterize `dashboard.py` on `week_start`. Update tests.
 3. Backend: new `outreach_history.py` handler + tests + api template
    route registration (`GET /outreach/history`).
@@ -279,7 +297,8 @@ in UTC).
 6. Frontend: new `OutreachHistory.tsx` page + router entry + nav
    item.
 7. Manual end-to-end on the live deploy.
-8. End-of-slice: write `docs/slices/12-*.md` plan.
+8. End-of-slice: write `docs/slices/13-tailored-pdf-generation.md`
+   plan (slice 12 shelved; slice 13 is next).
 
 ## Resumption notes
 

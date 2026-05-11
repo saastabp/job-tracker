@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Row, Col, Card, Spinner, Alert, ProgressBar } from 'react-bootstrap';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useApi } from '../api/client';
+import WeekNav, { currentMonday } from '../components/WeekNav';
 import { StatusBadge } from './Submissions';
 
 interface Metric {
@@ -27,6 +28,7 @@ interface RecentSubmission {
 interface DashboardData {
   today: string;
   week_start: string;
+  is_current_week: boolean;
   metrics: {
     submissions: Metric;
     personal_outreach: Metric;
@@ -76,18 +78,33 @@ function ProgressTile({
 
 export default function Dashboard() {
   const apiFetch = useApi();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const weekStart = searchParams.get('week') || currentMonday();
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    apiFetch('/dashboard/today')
+    const controller = new AbortController();
+    setError(null);
+    apiFetch(
+      `/dashboard/today?week_start=${encodeURIComponent(weekStart)}`,
+      { signal: controller.signal },
+    )
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
       .then(setData)
-      .catch((e) => setError(String(e)));
-  }, [apiFetch]);
+      .catch((e) => {
+        if (e.name === 'AbortError') return;
+        setError(String(e));
+      });
+    return () => controller.abort();
+  }, [apiFetch, weekStart]);
+
+  function handleWeekChange(next: string) {
+    setSearchParams({ week: next });
+  }
 
   if (error) return <Alert variant="danger">{error}</Alert>;
   if (!data) return <Spinner animation="border" size="sm" />;
@@ -98,21 +115,31 @@ export default function Dashboard() {
     <>
       <h3 className="mb-4">Dashboard</h3>
 
-      <h5 className="text-muted">Today ({data.today})</h5>
-      <Row className="g-3 mb-4">
-        {TODAY_TILES.map(({ key, label }) => (
-          <Col md={4} key={`today-${key}`}>
-            <ProgressTile
-              label={label}
-              count={m[key].today ?? 0}
-              goal={m[key].daily}
-              inboundCount={m[key].inbound_today}
-            />
-          </Col>
-        ))}
-      </Row>
+      <WeekNav weekStart={weekStart} onChange={handleWeekChange} />
 
-      <h5 className="text-muted">This week (since {data.week_start})</h5>
+      {data.is_current_week && (
+        <>
+          <h5 className="text-muted">Today ({data.today})</h5>
+          <Row className="g-3 mb-4">
+            {TODAY_TILES.map(({ key, label }) => (
+              <Col md={4} key={`today-${key}`}>
+                <ProgressTile
+                  label={label}
+                  count={m[key].today ?? 0}
+                  goal={m[key].daily}
+                  inboundCount={m[key].inbound_today}
+                />
+              </Col>
+            ))}
+          </Row>
+        </>
+      )}
+
+      <h5 className="text-muted">
+        {data.is_current_week
+          ? `This week (since ${data.week_start})`
+          : `Week of ${data.week_start}`}
+      </h5>
       <Row className="g-3 mb-4">
         {TODAY_TILES.map(({ key, label }) => (
           <Col md={4} key={`week-${key}`}>
