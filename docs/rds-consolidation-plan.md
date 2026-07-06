@@ -113,12 +113,12 @@ conventions — Claude drafts, does not execute).
 5. **Spot-check** row counts on the shared `legacytracker` schema vs the dump.
 
 ### Phase C — Repoint legacy to the shared instance (legacy repo)
-6. **Convert `legacytracker-data` into an SSM-only stack** (see §4). It stops
-   creating an RDS instance and instead republishes the shared instance's
-   endpoint/port/resource-id under `/legacytracker/data/*`, with
-   `db-name = legacytracker`. Deploy it as an **update** (CFN deletes the
-   `Db` resource → fires the `Snapshot` DeletionPolicy → keeps a final
-   automatic snapshot of `legacytracker-db`).
+6. **Repoint `legacytracker-data` at the shared instance — non-destructive**
+   (data-stack Rev 1, see §4). Change the `/legacytracker/data/*`
+   endpoint/port/resource-id SSM param *values* to the shared instance's coords,
+   but **keep** the `Db` resource so the old instance stays alive as a rollback.
+   `db-name` stays `legacytracker`. The old RDS is deleted later, as a separate
+   deliberate step (Phase D), only after the repoint is verified.
 7. **Set the legacy Lambda user to `legacytracker_app`** — change the
    `DbUser` parameter default (or samconfig override) in
    `legacy-tracker/infra/api`. The IAM resource ARN is already templated as
@@ -129,15 +129,18 @@ conventions — Claude drafts, does not execute).
 8. **Smoke-test the legacy app** end-to-end against the shared instance.
 
 ### Phase D — Decommission (destructive — only after C verifies)
-9. **Drop the sandbox** (decided: not migrated). Delete the
-   `legacytracker-sandbox-api` and sandbox-frontend stacks:
-   `aws cloudformation delete-stack --stack-name legacytracker-sandbox-api`.
-   The `legacytracker_sandbox` schema is never moved to the shared instance —
-   it dies with the old `legacytracker-db`. No sandbox user is created on the
-   shared instance.
-10. **Delete the `legacytracker-data` RDS** — already handled by the step-6
-    update if the `Db` resource was removed there; confirm the instance is
-    gone and a final snapshot exists.
+9. **Keep the sandbox** (decision changed — it *is* consolidated). The
+   `legacytracker-sandbox-api` and sandbox-frontend stacks stay; the
+   `legacytracker_sandbox` schema + `legacytracker_sandbox_app` user already
+   live on the shared instance from the rehearsal. Do **not** delete these
+   stacks. The old instance's copy of `legacytracker_sandbox` dies with
+   `legacytracker-db` (harmless — superseded by the shared copy).
+10. **Delete the `legacytracker-data` RDS** — deploy data-stack **Rev 2**
+    (remove the `Db` + `DbSubnetGroup`), which fires the `Snapshot`
+    DeletionPolicy and deletes `legacytracker-db`. This is the only
+    instance-destroying step and runs only after step 8's smoke-test confirms
+    prod on the shared instance. Confirm the instance is gone and a final
+    snapshot exists.
 11. **Delete the `legacytracker-network` stack** (the VPC). Safe because no
     Lambda runs in it and the RDS that used its subnet group is gone. No ENI
     cleanup concern — the Lambdas were never VPC-attached (contrast the
@@ -158,11 +161,14 @@ user, and SSM are all untouched.
 > here.
 
 ### legacy-tracker repo
-- **`infra/data/template.yaml`** — full rewrite to **SSM-only**. Remove the
-  `Db` (`AWS::RDS::DBInstance`), `DbSubnetGroup`, the
+- **`infra/data/template.yaml`** — reach the **SSM-only** end state in **two
+  deploys** so the RDS teardown is decoupled from the repoint. **Rev 1** (Phase
+  C): keep the `Db` + `DbSubnetGroup` but change the `/legacytracker/data/*`
+  param values to the shared coords (old instance stays alive). **Rev 2** (Phase
+  D, post-verify): remove the `Db` (`AWS::RDS::DBInstance`), `DbSubnetGroup`, the
   `PublicSubnetIds`/`RdsSgId`/`DbInstanceClass` params, and
-  `SsmDbMasterSecretArn` (legacy no longer owns a master credential). Add
-  params sourced from job-tracker's SSM and republish under
+  `SsmDbMasterSecretArn` (legacy no longer owns a master credential). The final
+  SSM-only shape adds params sourced from job-tracker's SSM and republishes under
   `/legacytracker/data/*`:
   ```yaml
   Parameters:
@@ -182,28 +188,31 @@ user, and SSM are all untouched.
   `deploy-api`, `deploy-all`, `.PHONY`, and `help`; delete the
   `deploy-network` target. Repoint `db-creds` from
   `/legacytracker/data/db-master-secret-arn` →
-  `/jobtracker/data/db-master-secret-arn`. **Remove all sandbox machinery**
-  (`SANDBOX_DB_NAME`, `bootstrap-sandbox-db`, `deploy-sandbox-*`,
-  `wire-sandbox-frontend`) — sandbox is being dropped.
-- **`infra/network/`** and **`infra/api/template-sandbox.yaml`** — deleted
-  with their stacks (Phase D). Leave a short note in the legacy README that
-  the DB now lives in the shared `jobtracker-db` instance.
+  `/jobtracker/data/db-master-secret-arn`. **Update the sandbox machinery**
+  (sandbox is kept): drop the `deploy-network deploy-data` prereqs from
+  `deploy-sandbox-api`; the sandbox now reads the republished
+  `/legacytracker/data/*` with `DbUser=legacytracker_sandbox_app`.
+- **`infra/network/`** — deleted with the `legacytracker-network` stack
+  (Phase D). **`infra/api/template-sandbox.yaml` is kept** (sandbox stays); only
+  its `DbUser` default changes. The legacy README notes the DB now lives in the
+  shared `jobtracker-db` instance.
 
-### Decided: sandbox is dropped
-The live `legacytracker-sandbox-api` (shared the old instance via a
-`legacytracker_sandbox` schema as `app`) is **not** migrated. Only one legacy
-user is created on the shared instance: `legacytracker_app`,
-`GRANT ALL ON legacytracker.*` only.
+### Decided: sandbox is kept and consolidated
+The live `legacytracker-sandbox-api` (previously shared the old instance via a
+`legacytracker_sandbox` schema as `app`) **is** migrated to the shared instance
+during the rehearsal and kept there. Two legacy users exist on the shared
+instance, each scoped to its own schema: `legacytracker_app`
+(`GRANT ALL ON legacytracker.*`) and `legacytracker_sandbox_app`
+(`GRANT ALL ON legacytracker_sandbox.*`).
 
 > **Amendment (rehearsal-first):** before the real Phase A–B run, the sandbox is
 > used as a **dress rehearsal** of the whole mechanism — its
 > `legacytracker_sandbox` schema is temporarily migrated to the shared instance
 > under a `legacytracker_sandbox_app` user, the sandbox api is repointed, and
 > the flow is verified end-to-end. See `rds-consolidation-sandbox-rehearsal.md`.
-> That rehearsal is then torn down (§6 of that doc), restoring this
-> "sandbox is dropped" end state — *unless* the sandbox is deliberately kept on
-> the shared instance (§7 there), in which case a `legacytracker_sandbox_app`
-> user persists alongside `legacytracker_app`.
+> **Decision landed on keep:** the rehearsal was *not* torn down — the sandbox
+> stays consolidated on the shared instance (§7 of that doc), so a
+> `legacytracker_sandbox_app` user persists alongside `legacytracker_app`.
 
 ### job-tracker repo
 - **None to code or infra.** Optionally document in this repo's README that

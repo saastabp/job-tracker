@@ -1,9 +1,20 @@
-# RDS Consolidation — Phase A–B Runbook (copy-paste)
+# RDS Consolidation — Full Cutover Runbook (copy-paste)
 
-Companion to `rds-consolidation-plan.md`. Concrete commands for the
-snapshot → bootstrap → data-move steps. **Brian runs all of these.** They are
-read-only against the legacy source until the very end; nothing here deletes an
-instance (that's Phase D in the plan).
+Companion to `rds-consolidation-plan.md`. End-to-end commands for the real
+production cutover: snapshot → bootstrap → data-move → repoint → decommission
+(plan Phases A–D). **Brian runs all of these.**
+
+Prerequisite: the sandbox rehearsal (`rds-consolidation-sandbox-rehearsal.md`)
+has already validated the mechanism (dump/load, IAM auth, per-schema isolation).
+Phases A–B are read-only against the legacy source. Phase C repoints the apps at
+the shared instance **without destroying anything** — the old instance stays
+live as a rollback. Phase D verifies, unfreezes, and only then — as a separate,
+deliberate step — tears down the old instance + VPC. Run C onward only after B4
+shows ROW COUNTS MATCH, inside the write-freeze window.
+
+**Decision change — the sandbox is kept, not dropped.** It already lives on the
+shared instance (from the rehearsal). Phase C redeploys it onto durable config;
+Phase D must **not** delete the sandbox stacks.
 
 All commands assume:
 
@@ -22,6 +33,49 @@ All commands assume:
 | Legacy master secret | `arn:aws:secretsmanager:us-west-2:381492047863:secret:rds!db-138e398b-50f3-42c4-9721-2b421cc5c2bf-681gf4` |
 | CA bundle | `/home/brians/projects/job-tracker/backend/src/rds-ca-bundle.pem` |
 
+### Prep — code edits (already staged in the legacy repo)
+
+Four edits make **both** legacy apps durably read the shared instance through
+the republished `/legacytracker/data/*` namespace — no CLI overrides, no
+reference to the old instance. **All four are already applied** in
+`~/360-balanced-living/legacy-tracker` (staged ahead of the run so you can work
+straight through). Full rationale in plan §4; summary of what's in place:
+
+1. `infra/data/template.yaml` → **two revisions** (the RDS teardown is
+   deliberately separated from the repoint):
+   - **Rev 1 = `infra/data/template.yaml` (applied now; deploys in Phase C —
+     non-destructive):** adds `SharedDb*` params sourced from `/jobtracker/data/*`
+     and changes the `/legacytracker/data/{db-endpoint,db-port,db-resource-id}`
+     SSM param *values* from `!GetAtt Db.*` to those shared coords. **Keeps** the
+     `Db` (`AWS::RDS::DBInstance`) + `DbSubnetGroup` — the old instance stays
+     alive. `db-name` stays `legacytracker`.
+   - **Rev 2 = `infra/data/template-rev2.yaml` (staged; deploys in Phase D —
+     destructive):** the SSM-only version with the `Db` + `DbSubnetGroup`
+     removed (they keep `DeletionPolicy: Snapshot`, so the delete takes a final
+     snapshot). At D4 you `cp` it over `template.yaml` and deploy. This is the
+     **only** step that deletes `legacytracker-db`, and it runs after Phase C is
+     verified.
+2. `infra/api/template.yaml` → `DbUser` default `app` → `legacytracker_app`.
+3. `infra/api/template-sandbox.yaml` → `DbUser` default `app` →
+   `legacytracker_sandbox_app` (endpoint/resource-id defaults **stay**
+   `/legacytracker/data/*` — they resolve to shared after edit #1).
+4. `infra/Makefile` → removed `deploy-network` from `deploy-data`/`deploy-api`/
+   `deploy-all`/`.PHONY`/`help` and deleted the `deploy-network` target; dropped
+   the `deploy-network deploy-data` prereqs from `deploy-sandbox-api`; repointed
+   `db-creds` to `/jobtracker/data/db-master-secret-arn`. (`bootstrap-sandbox-db`
+   is left in place with a "superseded" comment — do not run it post-cutover.)
+   **`deploy-api` and `deploy-sandbox-api` now pass `DbUser` explicitly** in
+   `--parameter-overrides` (`legacytracker_app` / `legacytracker_sandbox_app`) —
+   the template `Default:` change in #2/#3 is necessary but does **not** apply to
+   an already-deployed stack, because `sam deploy` reuses the stack's existing
+   parameter value for anything not passed. This is the fix for the "pages 500
+   with `Access denied for user 'app'`" symptom.
+
+Nothing here deploys until the cutover: Rev 1 deploys in Phase C (C1), Rev 2 in
+Phase D (D4). Deploying Rev 2 is what deletes the old RDS, so it must come after
+the Phase B data move **and** Phase C verification. Since the four edits are
+already in the working tree, review the diff (`git -C ~/360-balanced-living/legacy-tracker diff`) before you start, and commit whenever you like.
+
 ### Step 0 — session setup
 
 ```sh
@@ -30,6 +84,15 @@ export AWS_PROFILE=brian-admin AWS_REGION=us-west-2
 
 ```sh
 mysql --version && mysqldump --version
+```
+
+**Safety — tag the pre-cutover state** so the Phase D3 rollback is a clean
+restore. Run this **before** committing the staged cutover edits (it marks the
+original templates; if you've already committed them, append the parent commit
+hash: `git ... tag rds-pre-consolidation <hash>`):
+
+```sh
+git -C ~/360-balanced-living/legacy-tracker tag rds-pre-consolidation
 ```
 
 Load the two master passwords into shell vars (used by every `mysql`/`mysqldump` call below):
@@ -184,6 +247,183 @@ plumbing by hitting a legacy API endpoint and checking CloudWatch for a clean
 `db: connection opened` log. If it fails with `Access denied`, re-check the
 `SHOW GRANTS` output from A2 and that `EnableIAMDatabaseAuthentication` is on
 for the shared instance (it is, per the jobtracker-data template).
+
+---
+
+## Phase C — repoint prod + sandbox at the shared instance (non-destructive)
+
+Deploys the Prep edits' **Rev 1**. After this, `/legacytracker/data/*` resolves
+to the **shared** instance and both legacy apps read it, each scoped by its own
+`DbName` + `DbUser`. **Nothing is destroyed here — the old `legacytracker-db`
+stays alive** as a rollback net. Run only after **B4 shows ROW COUNTS MATCH**,
+inside the freeze.
+
+No prod-down window: because the old instance is still up, prod keeps serving
+before *and* after the redeploy — C2 just switches which instance the Lambdas
+resolve to, and the shared copy already has the verified data.
+
+### C1 — deploy data-stack Rev 1 (repoint the SSM coords, keep the old RDS)
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make deploy-data
+```
+
+Updates `/legacytracker/data/{db-endpoint,db-port,db-resource-id}` to the shared
+instance's values. The `Db` resource is untouched — the old instance keeps
+running, just unreferenced. Confirm the params now point at shared (endpoint
+should read `jobtracker-db…`, resource-id `db-S3W4OGB2Q5LC2HMLD4IZIS6FLQ`):
+
+```sh
+for p in db-endpoint db-port db-resource-id; do aws ssm get-parameter --name /legacytracker/data/$p --query Parameter.Value --output text; done
+```
+
+### C2 — redeploy the prod api
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make deploy-api
+```
+
+`deploy-api` passes `DbUser=legacytracker_app` **explicitly** in its
+`--parameter-overrides`. This is required: `sam deploy` reuses a stack's
+*existing* parameter value for anything not passed, so changing the template
+`Default:` alone leaves an already-deployed stack on `DbUser=app` (which then
+gets `Access denied` on `legacytracker`). It also picks up the republished
+`/legacytracker/data/*` (= shared). The IAM ARN `dbuser:${DbResourceId}/${DbUser}`
+auto-targets `dbuser:<sharedResourceId>/legacytracker_app`.
+
+### C3 — redeploy the sandbox api onto durable config
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make deploy-sandbox-api
+```
+
+`deploy-sandbox-api` passes `DbName=legacytracker_sandbox` and
+`DbUser=legacytracker_sandbox_app` **explicitly** (same `sam deploy` reuse rule
+as C2). Its DB-endpoint params keep their existing stored values
+(`/jobtracker/data/*` from the rehearsal), which resolve to the same shared
+instance — so the sandbox is on the shared DB either way. Both legacy apps now
+authenticate as their own per-schema user against `jobtracker-db`.
+
+---
+
+## Phase D — verify, unfreeze, then tear down the old instance (separate + destructive)
+
+The old instance is still alive until D4, so a verification failure rolls back
+**live** — no snapshot restore.
+
+### D1 — verify on the shared instance
+
+**Prod IAM-auth probe** — the migrate Lambda is invoked directly (bypasses the
+Cognito authorizer), so it's the cleanest scriptable prod check. It connects as
+`legacytracker_app`; prod is at 0007, so expect nothing pending:
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make migrate
+```
+
+Expect `{"applied": []}` (already at head). A clean return proves the prod Lambda
+authenticates as `legacytracker_app` against `jobtracker-db` via IAM.
+
+**Sandbox IAM-auth probe** — same, as `legacytracker_sandbox_app`:
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make migrate-sandbox
+```
+
+**Sandbox health endpoint** — the sandbox api has no Cognito, so it curls
+directly; expect `{"ok": true, ..., "db": {"ok": 1}}`:
+
+```sh
+SB_API=$(aws ssm get-parameter --name /legacytracker-sandbox/api/url --query Parameter.Value --output text --region us-west-2) && curl -s "$SB_API/health" && echo
+```
+
+**Prod end-user path** — prod `/health` sits behind Cognito, so it can't be
+curled unauthenticated. Open the prod SPA, log in, and exercise a real read +
+write:
+
+```sh
+aws ssm get-parameter --name /legacytracker/frontend/cloudfront-url --query Parameter.Value --output text --region us-west-2
+```
+
+Then confirm that request path hit the shared DB cleanly as `legacytracker_app`
+(substitute the function you exercised; `legacytracker-health` shown as example):
+
+```sh
+aws logs tail /aws/lambda/legacytracker-health --since 10m --region us-west-2 --format short
+```
+
+(look for a clean `db: connection opened` and no `Access denied`.)
+
+### D2 — unfreeze
+Once D1 is green, tell the user they're clear. They're now on the shared
+instance; the old one is running but idle. You can leave it as a rollback net for
+a cooling-off period before D4 — at the cost of paying for both instances until
+then.
+
+### D3 — rollback checkpoint
+If anything looked wrong in D1, abort here — the old instance is still alive.
+Restore the four pre-cutover templates from the Step 0 tag:
+
+```sh
+git -C ~/360-balanced-living/legacy-tracker checkout rds-pre-consolidation -- infra/data/template.yaml infra/api/template.yaml infra/api/template-sandbox.yaml infra/Makefile
+```
+
+Then redeploy — this repoints `/legacytracker/data/*` back to the old instance
+and returns both apps to `DbUser=app`:
+
+```sh
+cd ~/360-balanced-living/legacy-tracker/infra && make deploy-data && make deploy-api && make deploy-sandbox-api
+```
+
+Both apps are now back on the still-alive `legacytracker-db`, whose data is
+intact (the dump was read-only and the freeze blocked new writes). Investigate,
+then re-attempt from Phase C when ready. Only proceed past this point (to D4)
+once D1 is green.
+
+### D4 — tear down the old RDS (data-stack Rev 2)
+Swap the pre-staged Rev 2 template in for `template.yaml` (it removes the `Db` +
+`DbSubnetGroup`), then deploy:
+
+```sh
+cp ~/360-balanced-living/legacy-tracker/infra/data/template-rev2.yaml ~/360-balanced-living/legacy-tracker/infra/data/template.yaml && cd ~/360-balanced-living/legacy-tracker/infra && make deploy-data
+```
+
+CFN deletes `legacytracker-db`, firing the `Snapshot` deletion policy (final
+automatic snapshot). This is the **only** instance-destroying step, and it runs
+entirely after prod is confirmed on the shared instance.
+
+### D5 — delete the legacy VPC stack
+
+```sh
+aws cloudformation delete-stack --stack-name legacytracker-network --region us-west-2
+```
+
+Safe: the Lambdas were never in-VPC, and the old RDS that used the subnet group
+was just deleted in D4. No ENI-cleanup concern (that gotcha only applies when
+removing `VpcConfig` from in-VPC functions).
+
+### D6 — confirm + follow-ups
+
+```sh
+aws rds describe-db-instances --db-instance-identifier legacytracker-db --region us-west-2 2>&1 | head -3
+```
+
+(expect `DBInstanceNotFound`.)
+
+```sh
+aws rds describe-db-snapshots --db-instance-identifier legacytracker-db --region us-west-2 --query "DBSnapshots[].DBSnapshotIdentifier" --output text
+```
+
+> **Do NOT delete the sandbox stacks.** The sandbox is kept and now lives on the
+> shared instance. Only `legacytracker-network` is deleted here (the old RDS went
+> in D4). `legacytracker-sandbox-api` and the sandbox frontend stack stay.
+
+- **Buy the 1-yr no-upfront Reserved Instance** on `db.t4g.micro` MySQL
+  us-west-2 — auto-applies to the survivor, ~34% off compute, no downtime.
+  Highest-value post-cutover action.
+- After a ~30-day cooling-off, delete the pre-consolidation snapshots
+  (`jobtracker-preconsolidation`, `legacytracker-preconsolidation`) to stop
+  paying snapshot storage.
 
 ---
 
