@@ -195,6 +195,16 @@ The live `legacytracker-sandbox-api` (shared the old instance via a
 user is created on the shared instance: `legacytracker_app`,
 `GRANT ALL ON legacytracker.*` only.
 
+> **Amendment (rehearsal-first):** before the real Phase A–B run, the sandbox is
+> used as a **dress rehearsal** of the whole mechanism — its
+> `legacytracker_sandbox` schema is temporarily migrated to the shared instance
+> under a `legacytracker_sandbox_app` user, the sandbox api is repointed, and
+> the flow is verified end-to-end. See `rds-consolidation-sandbox-rehearsal.md`.
+> That rehearsal is then torn down (§6 of that doc), restoring this
+> "sandbox is dropped" end state — *unless* the sandbox is deliberately kept on
+> the shared instance (§7 there), in which case a `legacytracker_sandbox_app`
+> user persists alongside `legacytracker_app`.
+
 ### job-tracker repo
 - **None to code or infra.** Optionally document in this repo's README that
   `jobtracker-db` is now shared and hosts a second `legacytracker` schema
